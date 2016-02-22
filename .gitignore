@@ -1,0 +1,6 @@
+# Build directories
+smartjs/platforms/esp8266/build/
+smartjs/platforms/esp8266/firmware/
+
+# IntelliJ Idea
+.idea/
