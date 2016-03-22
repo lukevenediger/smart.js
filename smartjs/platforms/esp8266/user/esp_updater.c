@@ -1,62 +1,137 @@
+/*
+* Copyright (c) 2016 Cesanta Software Limited
+* All rights reserved
+*/
+
+#include "esp_updater.h"
+
+#include <stdint.h>
+
 #include <ets_sys.h>
 #include <osapi.h>
 #include <os_type.h>
 #include <user_interface.h>
-#include <stdio.h>
-
-#ifndef DISABLE_OTA
-
 #include "common/platforms/esp8266/esp_missing_includes.h"
-#include "smartjs/platforms/esp8266/user/esp_updater.h"
-#include "rboot/rboot/appcode/rboot-api.h"
-#include "smartjs/src/sj_config.h"
+#include "common/platforms/esp8266/rboot/rboot/appcode/rboot-api.h"
+#include "esp_fs.h"
+#include "smartjs/src/sj_v7_ext.h"
+#include "smartjs/src/sj_clubby.h"
 #include "smartjs/src/device_config.h"
 #include "smartjs/src/sj_mongoose.h"
-#include "smartjs/src/sj_clubby.h"
-#include "smartjs/src/sj_v7_ext.h"
-#include "v7/v7.h"
-#include "smartjs/platforms/esp8266/user/esp_fs.h"
+#include "mongoose/mongoose.h"
 
+#define MANIFEST_FILENAME "manifest.json"
+#define FW_SLOT_SIZE 0x100000
+#define SHA1SUM_LEN 40
+#define UPDATER_TEMP_FILE_NAME "ota_reply.conf"
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
-/* Must be provided externally, usually auto-generated. */
-extern const char *build_id;
-extern const char *build_timestamp;
-extern const char *build_version;
+/*
+ * --- Zip file local header structure ---
+ *                                             size  offset
+ * local file header signature   (0x04034b50)   4      0
+ * version needed to extract                    2      4
+ * general purpose bit flag                     2      6
+ * compression method                           2      8
+ * last mod file time                           2      10
+ * last mod file date                           2      12
+ * crc-32                                       4      14
+ * compressed size                              4      18
+ * uncompressed size                            4      22
+ * file name length                             2      26
+ * extra field length                           2      28
+ * file name (variable size)                    v      30
+ * extra field (variable size)                  v
+ */
 
-static int s_current_received;
-static size_t s_file_size;
-static int s_current_write_address;
-static size_t s_written;
-static int s_area_prepared;
+#define ZIP_LOCAL_HDR_SIZE 30U
+#define ZIP_GENFLAG_OFFSET 6U
+#define ZIP_COMPRESSION_METHOD_OFFSET 8U
+#define ZIP_CRC32_OFFSET 14U
+#define ZIP_COMPRESSED_SIZE_OFFSET 18U
+#define ZIP_UNCOMPRESSED_SIZE_OFFSET 22U
+#define ZIP_FILENAME_LEN_OFFSET 26U
+#define ZIP_EXTRAS_LEN_OFFSET 28U
+#define ZIP_FILENAME_OFFSET 30U
+#define ZIP_FILE_DESCRIPTOR_SIZE 12U
 
-static struct v7 *s_v7;
+static const uint32_t c_zip_header_signature = 0x04034b50;
+
 static v7_val_t s_updater_notify_cb;
-static enum update_status s_update_status;
-static os_timer_t s_update_timer;
-static os_timer_t s_reboot_timer;
-static char *s_manifest;
-static char *s_manifest_url;
-static char *s_fw_url;
-static char *s_fs_url;
-static char *s_fw_checksum;
-static char *s_fs_checksum;
-static char *s_new_fw_version;
-static int s_new_rom_number;
-static uint32_t s_last_received_time;
-static struct mg_connection *s_current_connection;
-enum download_status { DS_NOT_STARTED, DS_IN_PROGRESS, DS_COMPLETED, DS_ERROR };
-static enum download_status s_download_status = DS_NOT_STARTED;
-
+static struct v7 *s_v7;
 static struct clubby_event *s_clubby_reply;
 static int s_clubby_upd_status;
 
-#define UPDATER_TEMP_FILE_NAME "ota_reply.conf"
+/* From miniz */
+uint32_t mz_crc32(uint32_t crc, const char *ptr, size_t buf_len);
 
-/* Forward declarations */
-void set_boot_params(uint8_t new_rom, uint8_t prev_rom);
-static void mg_ev_handler(struct mg_connection *nc, int ev, void *ev_data);
-static int notify_js(enum update_status us, const char *info);
+/* Must be provided externally, usually auto-generated. */
+extern const char *build_version;
+
+/*
+ * Using static variable (not only c->user_data), it allows to check if update
+ * already in progress when another request arrives
+ */
+static struct update_context *s_ctx = NULL;
+
+enum update_status {
+  US_INITED,
+  US_WAITING_MANIFEST_HEADER,
+  US_WAITING_MANIFEST,
+  US_WAITING_FILE_HEADER,
+  US_WAITING_FILE,
+  US_SKIPPING_DATA,
+  US_SKIPPING_DESCRIPTOR,
+  US_FINISHED
+};
+
+enum js_update_status {
+  UJS_GOT_REQUEST,
+  UJS_COMPLETED,
+  UJS_NOTHING_TODO,
+  UJS_ERROR
+};
+
+struct part_info {
+  uint32_t addr;
+  char sha1sum[40];
+  char file_name[50];
+  uint32_t real_size;
+};
+
+struct zip_file_info {
+  char file_name[50];
+  uint32_t file_size;
+  uint32_t crc;
+  uint32_t crc_current;
+  uint32_t file_received_bytes;
+  int has_descriptor;
+};
+
+struct update_context {
+  const char *data;
+  size_t data_len;
+  struct mbuf unprocessed;
+  struct zip_file_info file_info;
+  enum update_status update_status;
+  const char *status_msg;
+
+  struct part_info fw_part;
+  struct part_info fs_part;
+  struct part_info *current_part;
+  uint32_t current_write_address;
+  uint32_t erased_till;
+
+  char version[14];
+
+  int parts_written;
+
+  int slot_to_write;
+  int need_reboot;
+
+  int result;
+  int archive_size;
+};
 
 rboot_config *get_rboot_config() {
   static rboot_config *cfg = NULL;
@@ -84,144 +159,393 @@ uint32_t get_fs_size(uint8_t rom) {
   return get_rboot_config()->fs_sizes[rom];
 }
 
-/*
- * Compose full url from manifest full url and FW relative url
- *
- * http://myserver/myfolder/manifest.json + ....
- * /updates/blah/0x11000.bin -> myserver/updates/blah/0x11000.bin
- * updates/blah/0x11000.bin ->
- *                      myserver/myfolder/updates/blah/0x11000.bin
- * //otherserver/updates/blah/0x11000.bin ->
- *                otherserver/myfolder/updates/blah/0x11000.bin
- */
-char *get_full_url(const char *base_url, const char *relative_url) {
-  char *ret;
-  /*
-   * some of libc implementation marks asprintf with WARN_UNUSED_RESULT
-   * this is fake attention to asprintf retval
-   */
-  int res;
-  (void) res;
-  if (strncmp(relative_url, "//", 2) == 0) {
-    /* uri is full url, just skipping `//` */
-    char *proto = NULL;
-    int proto_len = 0;
-    if (strncmp(base_url, "https", 5) == 0) {
-      proto = "https://";
-      proto_len = 8;
-    } else {
-      proto = "http://";
-      proto_len = 7;
-    }
-    res = asprintf(&ret, "%.*s%s", proto_len, proto, relative_url + 2);
-  } else if (strncmp(relative_url, "/", 1) == 0) {
-    /* /updates/blah/0x11000.bin -> myserver/updates/blah/0x11000.bin */
-    const char *start_pos = strstr(base_url, "//");
-    if (start_pos == NULL) {
-      start_pos = base_url;
-    } else {
-      start_pos += 2;
-    }
-    while (*start_pos != 0 && *start_pos != '/') {
-      start_pos++;
-    }
-    if (start_pos != 0) {
-      res = asprintf(&ret, "%.*s%s", (int) (start_pos - base_url), base_url,
-                     relative_url);
-    }
-  } else {
-    /*
-     * updates/blah/0x11000.bin ->
-     *                      myserver/myfolder/updates/blah/0x11000.bin
-     */
-    const char *server_base = base_url + strlen(base_url) - 1;
-    while (server_base != base_url && *server_base != '/') {
-      server_base--;
-    }
-    if (server_base != base_url) {
-      res = asprintf(&ret, "%.*s%s", (int) (server_base - base_url + 1),
-                     base_url, relative_url);
-    }
-  }
+static void context_init(struct update_context *ctx) {
+  memset(ctx, 0, sizeof(*ctx));
 
-  return ret;
-}
-
-static void disconnect() {
-  if (s_current_connection != NULL) {
-    s_current_connection->flags |= MG_F_CLOSE_IMMEDIATELY;
-  }
-  s_current_connection = NULL;
-}
-
-static void do_http_connect(const char *url) {
-  LOG(LL_DEBUG, ("Url: %s", url));
-  disconnect();
-
-  s_current_connection =
-      mg_connect_http(&sj_mgr, mg_ev_handler, url, NULL, NULL);
-#ifdef SSL_KRYPTON
-  if (memcmp(url, "https", 5) == 0 && get_cfg()->tls.enable) {
-    char *ca_file = get_cfg()->tls.ca_file;
-    char *server_name = get_cfg()->tls.server_name;
-    mg_set_ssl(s_current_connection, NULL, ca_file);
-    if (server_name != NULL) {
-      SSL_CTX_kr_set_verify_name(s_current_connection->ssl_ctx, server_name);
-    }
-  }
-#endif
-}
-
-static void do_http_connect_by_uri(const char *base_url,
-                                   const char *relative_url) {
-  char *url = get_full_url(base_url, relative_url);
-  do_http_connect(url);
-  free(url);
-}
-
-static void set_download_status(enum download_status ds) {
+  ctx->slot_to_write = get_rboot_config()->current_rom == 0 ? 1 : 0;
   LOG(LL_DEBUG,
-      ("Download status: %d -> %d", (int) s_download_status, (int) ds));
-  s_download_status = ds;
+      ("Initializing updater, slot to write: %d", ctx->slot_to_write));
 }
 
-static void set_update_status(enum update_status us) {
-  LOG(LL_DEBUG, ("Update status: %d -> %d", (int) s_update_status, us));
-  s_update_status = us;
+static void context_release(struct update_context *ctx) {
+  mbuf_free(&ctx->unprocessed);
 }
 
-static int verify_timeout() {
-  if (system_get_time() - s_last_received_time >
-      (uint32_t)(get_cfg()->update.server_timeout * 1000000)) {
-    disconnect();
-    set_update_status(US_ERROR);
-    set_download_status(DS_ERROR);
-    LOG(LL_ERROR, ("Timeout"));
-    return 1;
+/*
+ * During its work, updater requires requires to store some data.
+ * For example, manifest file, zip header - must be received fully, while
+ * content FW/FS files can be flashed directly from recv_mbuf
+ * To avoid extra memory usage, context contains plain pointer (*data)
+ * and mbuf (unprocessed); data is storing in memory only if where is no way
+ * to process it right now.
+ */
+static void context_update(struct update_context *ctx, const char *data,
+                           size_t len) {
+  if (ctx->unprocessed.len != 0) {
+    /* We have unprocessed data, concatenate them with arrived */
+    mbuf_append(&ctx->unprocessed, data, len);
+    ctx->data = ctx->unprocessed.buf;
+    ctx->data_len = ctx->unprocessed.len;
+    LOG(LL_DEBUG, ("Added %u bytes to cached data", len));
   } else {
+    /* No unprocessed, trying to process directly received data */
+    ctx->data = data;
+    ctx->data_len = len;
+  }
+
+  LOG(LL_DEBUG, ("Data size: %u bytes", ctx->data_len));
+}
+
+static void context_save_unprocessed(struct update_context *ctx) {
+  if (ctx->unprocessed.len == 0) {
+    mbuf_append(&ctx->unprocessed, ctx->data, ctx->data_len);
+    ctx->data = ctx->unprocessed.buf;
+    ctx->data_len = ctx->unprocessed.len;
+    LOG(LL_DEBUG, ("Added %d bytes to cached data", ctx->data_len));
+  } else {
+    LOG(LL_DEBUG, ("Skip caching"));
+  }
+}
+
+static void context_remove_data(struct update_context *ctx, size_t len) {
+  LOG(LL_DEBUG, ("Removing %d bytes", len));
+
+  if (ctx->unprocessed.len != 0) {
+    /* Consumed data from unprocessed*/
+    mbuf_remove(&ctx->unprocessed, len);
+    ctx->data = ctx->unprocessed.buf;
+    ctx->data_len = ctx->unprocessed.len;
+    LOG(LL_DEBUG, ("Removed %d bytes from cached data", len));
+  } else {
+    /* Consumed received data */
+    ctx->data = ctx->data + len;
+    ctx->data_len -= len;
+  }
+
+  LOG(LL_DEBUG, ("Data size: %u bytes", ctx->data_len));
+}
+
+static void context_clear_file_info(struct update_context *ctx) {
+  memset(&ctx->file_info, 0, sizeof(ctx->file_info));
+}
+
+struct update_context *context_create() {
+  if (s_ctx != NULL) {
+    return NULL;
+  }
+
+  s_ctx = calloc(1, sizeof(*s_ctx));
+  context_init(s_ctx);
+
+  return s_ctx;
+}
+
+static int fill_zip_header(struct update_context *ctx) {
+  if (ctx->data_len < ZIP_LOCAL_HDR_SIZE) {
+    LOG(LL_DEBUG, ("Zip header is incomplete"));
+    /* Need more data*/
     return 0;
   }
+
+  if (memcmp(ctx->data, &c_zip_header_signature,
+             sizeof(c_zip_header_signature)) != 0) {
+    ctx->status_msg = "Malformed archive (invalid header)";
+    LOG(LL_ERROR, ("Malformed archive (invalid header)"));
+    return -1;
+  }
+
+  uint16_t file_name_len, extras_len;
+  memcpy(&file_name_len, ctx->data + ZIP_FILENAME_LEN_OFFSET,
+         sizeof(file_name_len));
+  memcpy(&extras_len, ctx->data + ZIP_EXTRAS_LEN_OFFSET, sizeof(extras_len));
+
+  LOG(LL_DEBUG, ("Filename len = %d bytes, extras len = %d bytes",
+                 (int) file_name_len, (int) extras_len));
+  if (ctx->data_len < ZIP_LOCAL_HDR_SIZE + file_name_len + extras_len) {
+    /* Still need mode data */
+    return 0;
+  }
+
+  uint16_t compression_method;
+  memcpy(&compression_method, ctx->data + ZIP_COMPRESSION_METHOD_OFFSET,
+         sizeof(compression_method));
+
+  LOG(LL_DEBUG, ("Compression method=%d", (int) compression_method));
+  if (compression_method != 0) {
+    /* Do not support compressed archives */
+    ctx->status_msg = "File is compressed";
+    LOG(LL_ERROR, ("File is compressed)"));
+    return -1;
+  }
+
+  int i;
+  char *nodir_file_name = (char *) ctx->data + ZIP_FILENAME_OFFSET;
+  uint16_t nodir_file_name_len = file_name_len;
+  LOG(LL_DEBUG,
+      ("File name: %.*s", (int) nodir_file_name_len, nodir_file_name));
+
+  for (i = 0; i < file_name_len; i++) {
+    /* archive may contain folder, but we skip it, using filenames only */
+    if (*(ctx->data + ZIP_FILENAME_OFFSET + i) == '/') {
+      nodir_file_name = (char *) ctx->data + ZIP_FILENAME_OFFSET + i + 1;
+      nodir_file_name_len -= (i + 1);
+      break;
+    }
+  }
+
+  LOG(LL_DEBUG,
+      ("File name to use: %.*s", (int) nodir_file_name_len, nodir_file_name));
+
+  if (nodir_file_name_len >= sizeof(ctx->file_info.file_name)) {
+    /* We are in charge of file names, right? */
+    LOG(LL_ERROR, ("Too long file name"));
+    ctx->status_msg = "Too long file name";
+    return -1;
+  }
+  memcpy(ctx->file_info.file_name, nodir_file_name, nodir_file_name_len);
+
+  memcpy(&ctx->file_info.file_size, ctx->data + ZIP_COMPRESSED_SIZE_OFFSET,
+         sizeof(ctx->file_info.file_size));
+
+  uint32_t uncompressed_size;
+  memcpy(&uncompressed_size, ctx->data + ZIP_UNCOMPRESSED_SIZE_OFFSET,
+         sizeof(uncompressed_size));
+
+  if (ctx->file_info.file_size != uncompressed_size) {
+    /* Probably malformed archive*/
+    LOG(LL_ERROR, ("Malformed archive"));
+    ctx->status_msg = "Malformed archive";
+    return -1;
+  }
+
+  LOG(LL_DEBUG, ("File size: %d", ctx->file_info.file_size));
+
+  uint16_t gen_flag;
+  memcpy(&gen_flag, ctx->data + ZIP_GENFLAG_OFFSET, sizeof(gen_flag));
+  ctx->file_info.has_descriptor = gen_flag & (1 << 3);
+
+  LOG(LL_DEBUG, ("General flag=%d", (int) gen_flag));
+
+  memcpy(&ctx->file_info.crc, ctx->data + ZIP_CRC32_OFFSET,
+         sizeof(ctx->file_info.crc));
+
+  LOG(LL_DEBUG, ("CRC32: %u", ctx->file_info.crc));
+
+  context_remove_data(ctx, ZIP_LOCAL_HDR_SIZE + file_name_len + extras_len);
+
+  return 1;
 }
 
-static int prepare_area(uint32_t addr, int size) {
-  int sector_no = addr / 0x1000;
+static int fill_part_info(struct update_context *ctx,
+                          struct json_token *parts_tok, const char *part_name,
+                          struct part_info *pi) {
+  struct json_token *part_tok = find_json_token(parts_tok, part_name);
 
-  while (size >= 0) {
-    if (spi_flash_erase_sector(sector_no) != 0) {
-      LOG(LL_ERROR, ("Cannot erase sector %X", sector_no));
+  if (part_tok == NULL) {
+    LOG(LL_ERROR, ("Part %s not found", part_name));
+    return -1;
+  }
+
+  struct json_token *addr_tok = find_json_token(part_tok, "addr");
+  if (addr_tok == NULL) {
+    LOG(LL_ERROR, ("Addr token not found in manifest"));
+    return -1;
+  }
+
+  /*
+   * we can use strtol for non-null terminated string here, we have
+   * symbols immediately after address which will  stop number parsing
+   */
+  pi->addr = strtol(addr_tok->ptr, NULL, 16);
+  if (pi->addr == 0) {
+    /* Only rboot can has addr = 0, but we do not update rboot now */
+    LOG(LL_ERROR, ("Invalid address in manifest"));
+    return -1;
+  }
+
+  LOG(LL_DEBUG, ("Addr to write from manifest: %X", pi->addr));
+  /*
+   * manifest always contain relative addresses, we have to
+   * convert them to absolute (+0x100000 for slot #1)
+   */
+  pi->addr += ctx->slot_to_write * FW_SLOT_SIZE;
+  LOG(LL_DEBUG, ("Addr to write to use: %X", pi->addr));
+
+  struct json_token *sha1sum_tok = find_json_token(part_tok, "cs_sha1");
+  if (sha1sum_tok == NULL || sha1sum_tok->type != JSON_TYPE_STRING ||
+      sha1sum_tok->len != sizeof(pi->sha1sum)) {
+    LOG(LL_ERROR, ("cs_sha1 token not found in manifest"));
+    return -1;
+  }
+  memcpy(pi->sha1sum, sha1sum_tok->ptr, sizeof(pi->sha1sum));
+
+  struct json_token *file_name_tok = find_json_token(part_tok, "src");
+  if (file_name_tok == NULL || file_name_tok->type != JSON_TYPE_STRING ||
+      (size_t) file_name_tok->len > sizeof(pi->file_name) - 1) {
+    LOG(LL_ERROR, ("cs_sha1 token not found in manifest"));
+    return -1;
+  }
+
+  memcpy(pi->file_name, file_name_tok->ptr, file_name_tok->len);
+
+  LOG(LL_DEBUG,
+      ("Part %s : addr: %X sha1: %.*s src: %s", part_name, (int) pi->addr,
+       sizeof(pi->sha1sum), pi->sha1sum, pi->file_name));
+
+  return 1;
+}
+
+static int fill_manifest(struct update_context *ctx) {
+  struct json_token *toks =
+      parse_json2((char *) ctx->data, ctx->file_info.file_size);
+  if (toks == NULL) {
+    LOG(LL_ERROR, ("Failed to parse manifest"));
+    goto error;
+  }
+
+  struct json_token *parts_tok = find_json_token(toks, "parts");
+  if (parts_tok == NULL) {
+    LOG(LL_ERROR, ("parts token not found in manifest"));
+    goto error;
+  }
+
+  if (fill_part_info(ctx, parts_tok, "fw", &ctx->fw_part) < 0 ||
+      fill_part_info(ctx, parts_tok, "fs", &ctx->fs_part) < 0) {
+    goto error;
+  }
+
+  struct json_token *version_tok = find_json_token(toks, "version");
+  if (version_tok == NULL || version_tok->type != JSON_TYPE_STRING ||
+      version_tok->len != sizeof(ctx->version)) {
+    LOG(LL_ERROR, ("version token not found in manifest"));
+    goto error;
+  }
+
+  memcpy(ctx->version, version_tok->ptr, sizeof(ctx->version));
+  LOG(LL_DEBUG, ("Version: %.*s", sizeof(ctx->version), ctx->version));
+
+  context_remove_data(ctx, ctx->file_info.file_size);
+
+  return 1;
+
+error:
+  ctx->status_msg = "Invalid manifest";
+  return -1;
+}
+
+static int prepare_flash(struct update_context *ctx, uint32_t bytes_to_write) {
+  while (ctx->current_write_address + bytes_to_write > ctx->erased_till) {
+    uint32_t sec_no = ctx->erased_till / FLASH_SECTOR_SIZE;
+
+    if ((ctx->erased_till % FLASH_ERASE_BLOCK_SIZE) == 0 &&
+        ctx->current_part->addr + ctx->current_part->real_size >=
+            ctx->erased_till + FLASH_ERASE_BLOCK_SIZE) {
+      LOG(LL_DEBUG, ("Erasing block @sector %X", sec_no));
+      uint32_t block_no = ctx->erased_till / FLASH_ERASE_BLOCK_SIZE;
+      if (SPIEraseBlock(block_no) != 0) {
+        LOG(LL_ERROR, ("Failed to erase flash block %X", block_no));
+        return -1;
+      }
+      ctx->erased_till = (block_no + 1) * FLASH_ERASE_BLOCK_SIZE;
+    } else {
+      LOG(LL_DEBUG, ("Erasing sector %X", sec_no));
+      if (spi_flash_erase_sector(sec_no) != 0) {
+        LOG(LL_ERROR, ("Failed to erase flash sector %X", sec_no));
+        return -1;
+      }
+      ctx->erased_till = (sec_no + 1) * FLASH_SECTOR_SIZE;
+    }
+  }
+
+  return 1;
+}
+
+static int process_file_data(struct update_context *ctx, int ignore_data) {
+  uint32_t bytes_to_write =
+      ctx->file_info.file_size - ctx->file_info.file_received_bytes;
+  bytes_to_write =
+      bytes_to_write < ctx->data_len ? bytes_to_write : ctx->data_len;
+
+  LOG(LL_DEBUG,
+      ("File size: %u, received: %u to_write: %u", ctx->file_info.file_size,
+       ctx->file_info.file_received_bytes, bytes_to_write));
+
+  /*
+   * if ignore_data=1 we have to skip all received data
+   * (usually - extra files in archive)
+   * if ignore_data=0 we have to write data to flash
+   */
+  if (!ignore_data) {
+    if (prepare_flash(ctx, bytes_to_write) < 0) {
+      ctx->status_msg = "Failed to erase flash";
       return -1;
     }
 
-    pp_soft_wdt_restart();
+    /* Write buffer size must be aligned to 4 */
+    uint32_t bytes_to_write_aligned = bytes_to_write & -4;
+    LOG(LL_DEBUG, ("Aligned size=%u", bytes_to_write_aligned));
 
-    size -= 0x1000;
-    sector_no++;
+    ctx->file_info.crc_current =
+        mz_crc32(ctx->file_info.crc_current, ctx->data, bytes_to_write_aligned);
+
+    LOG(LL_DEBUG, ("Writing %u bytes @%X", bytes_to_write_aligned,
+                   ctx->current_write_address));
+
+    if (spi_flash_write(ctx->current_write_address, (uint32_t *) ctx->data,
+                        bytes_to_write_aligned) != 0) {
+      LOG(LL_ERROR, ("Failed to write to flash"));
+      ctx->status_msg = "Failed to write to flash";
+      return -1;
+    }
+
+    ctx->current_write_address += bytes_to_write_aligned;
+    ctx->file_info.file_received_bytes += bytes_to_write_aligned;
+    context_remove_data(ctx, bytes_to_write_aligned);
+
+    uint32_t rest =
+        ctx->file_info.file_size - ctx->file_info.file_received_bytes;
+
+    LOG(LL_DEBUG, ("Rest=%u", rest));
+    if (rest != 0 && rest < 4 && ctx->data_len >= 4) {
+      /* File size is not aligned to 4, using align buf to write it */
+      uint8_t align_buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+      memcpy(align_buf, ctx->data, rest);
+      LOG(LL_DEBUG, ("Writing 4 bytes @%X", ctx->current_write_address));
+      if (spi_flash_write(ctx->current_write_address, (uint32_t *) align_buf,
+                          4) != 0) {
+        LOG(LL_ERROR, ("Failed to write to flash"));
+        ctx->status_msg = "Failed to write to flash";
+        return -1;
+      }
+      ctx->file_info.crc_current =
+          mz_crc32(ctx->file_info.crc_current, ctx->data, rest);
+
+      ctx->file_info.file_received_bytes += rest;
+      context_remove_data(ctx, rest);
+    }
+    if (ctx->file_info.file_received_bytes == ctx->file_info.file_size) {
+      LOG(LL_INFO, ("Wrote %s (%u bytes)", ctx->file_info.file_name,
+                    ctx->file_info.file_size))
+    }
+  } else {
+    LOG(LL_DEBUG, ("Skipping %u bytes", bytes_to_write));
+    ctx->file_info.file_received_bytes += bytes_to_write;
+    context_remove_data(ctx, bytes_to_write);
   }
 
-  return 0;
+  LOG(LL_DEBUG, ("On exit file size: %u, received: %u",
+                 ctx->file_info.file_size, ctx->file_info.file_received_bytes));
+
+  return ctx->file_info.file_size == ctx->file_info.file_received_bytes;
+}
+
+static int have_more_files(struct update_context *ctx) {
+  LOG(LL_DEBUG, ("Parts written: %d", ctx->parts_written));
+  return ctx->parts_written == 2; /* FW + FS */
 }
 
 static void bin2hex(const uint8_t *src, int src_len, char *dst) {
+  /* TODO(alashkin) : try to use mg_hexdump */
   int i = 0;
   for (i = 0; i < src_len; i++) {
     sprintf(dst, "%02x", (int) *src);
@@ -256,391 +580,484 @@ static int verify_checksum(uint32_t addr, size_t len,
     addr += to_read;
     len -= to_read;
 
-    pp_soft_wdt_restart();
+    sj_wdt_feed();
   }
 
   cs_sha1_final(read_buf, &ctx);
   bin2hex(read_buf, 20, written_checksum);
-  LOG(LL_DEBUG, ("Written FW checksum: %s Provided checksum: %s",
-                 written_checksum, provided_checksum));
+  LOG(LL_DEBUG,
+      ("Written FW checksum: %.*s Provided checksum: %.*s", SHA1SUM_LEN,
+       written_checksum, SHA1SUM_LEN, provided_checksum));
 
-  if (strcmp(written_checksum, provided_checksum) != 0) {
+  if (strncmp(written_checksum, provided_checksum, SHA1SUM_LEN) != 0) {
     LOG(LL_ERROR, ("Checksum verification failed"));
-    return 1;
+    return -1;
   } else {
-    LOG(LL_INFO, ("Checksum verification ok"));
-    return 0;
+    LOG(LL_DEBUG, ("Checksum verification ok"));
+    return 1;
   }
 }
 
-static void download_error(struct mg_connection *nc) {
-  set_download_status(DS_ERROR);
-  nc->flags |= MG_F_CLOSE_IMMEDIATELY;
+static int prepare_to_write(struct update_context *ctx,
+                            struct part_info *part) {
+  ctx->current_part = part;
+  ctx->current_part->real_size = ctx->file_info.file_size;
+  ctx->current_write_address = part->addr;
+  ctx->erased_till = ctx->current_write_address;
+
+  return 1;
 }
 
-static void mg_ev_handler(struct mg_connection *nc, int ev, void *ev_data) {
-  switch (ev) {
-    case MG_EV_CONNECT: {
-      if (*(int *) ev_data != 0) {
-        LOG(LL_ERROR, ("fw_updater: connect() failed: %d", (int *) ev_data));
-        download_error(nc);
-      } else {
-        LOG(LL_DEBUG, ("fw_updater: connected"));
-        if (s_update_status != US_WAITING_METADATA) {
-          /* Disable HTTP proto handler, we'll process response ourselves. */
-          nc->proto_handler = NULL;
+static void set_status(struct update_context *ctx, enum update_status st) {
+  LOG(LL_DEBUG, ("Update status %d -> %d", (int) ctx->update_status, (int) st));
+  ctx->update_status = st;
+}
+
+static int finalize_write(struct update_context *ctx) {
+  ctx->parts_written++;
+
+  if (ctx->file_info.crc != ctx->file_info.crc_current) {
+    LOG(LL_ERROR, ("Invalid CRC, want %u, got %u", ctx->file_info.crc,
+                   ctx->file_info.crc_current));
+    ctx->status_msg = "Invalid CRC";
+    return -1;
+  }
+
+  if (verify_checksum(ctx->current_part->addr, ctx->file_info.file_size,
+                      ctx->current_part->sha1sum) < 0) {
+    ctx->status_msg = "Invalid checksum";
+    return -1;
+  }
+
+  return 1;
+}
+
+void update_rboot_config(struct update_context *ctx) {
+  rboot_config *cfg = get_rboot_config();
+  cfg->previous_rom = cfg->current_rom;
+  cfg->current_rom = ctx->slot_to_write;
+  cfg->fs_addresses[cfg->current_rom] = ctx->fs_part.addr;
+  cfg->fs_sizes[cfg->current_rom] = ctx->fs_part.real_size;
+  cfg->roms[cfg->current_rom] = ctx->fw_part.addr;
+  cfg->roms_sizes[cfg->current_rom] = ctx->fw_part.real_size;
+  cfg->is_first_boot = 1;
+  cfg->fw_updated = 1;
+  cfg->boot_attempts = 0;
+  rboot_set_config(cfg);
+
+  LOG(LL_DEBUG,
+      ("New rboot config: "
+       "prev_rom: %d, current_room: %d current_rom addr: %X, "
+       "current_rom size: %d, current_fs addr: %X, current_fs size: %d",
+       (int) cfg->previous_rom, (int) cfg->current_rom,
+       cfg->roms[cfg->current_rom], cfg->roms_sizes[cfg->current_rom],
+       cfg->fs_addresses[cfg->current_rom], cfg->fs_sizes[cfg->current_rom]));
+}
+
+static int updater_process(struct update_context *ctx, const char *data,
+                           size_t len) {
+  int ret;
+  if (len != 0) {
+    context_update(ctx, data, len);
+  }
+
+  while (true) {
+    switch (ctx->update_status) {
+      case US_INITED: {
+        set_status(ctx, US_WAITING_MANIFEST_HEADER);
+      } /* fall through */
+      case US_WAITING_MANIFEST_HEADER: {
+        if ((ret = fill_zip_header(ctx)) <= 0) {
+          if (ret == 0) {
+            context_save_unprocessed(ctx);
+          }
+          return ret;
         }
+        if (strncmp(ctx->file_info.file_name, MANIFEST_FILENAME,
+                    sizeof(MANIFEST_FILENAME)) != 0) {
+          /* We've got file header, but it isn't not metadata */
+          LOG(LL_ERROR, ("Get %s instead of %s", ctx->file_info.file_name,
+                         MANIFEST_FILENAME));
+          return -1;
+        }
+        set_status(ctx, US_WAITING_MANIFEST);
+      } /* fall through */
+      case US_WAITING_MANIFEST: {
+        /*
+         * Assume metadata isn't too big and might be cached
+         * otherwise we need streaming json-parser
+         */
+        if (ctx->data_len < ctx->file_info.file_size) {
+          return 0;
+        }
+
+        if (mz_crc32(0, ctx->data, ctx->file_info.file_size) !=
+            ctx->file_info.crc) {
+          LOG(LL_ERROR, ("Invalid CRC"));
+          ctx->status_msg = "Invalid CRC";
+          return -1;
+        }
+
+        if (fill_manifest(ctx) < 0) {
+          LOG(LL_ERROR, ("Invalid manifiest"));
+          ctx->status_msg = "Invalid manifest";
+          return -1;
+        }
+
+        if (strncmp(ctx->version, build_version, sizeof(ctx->version)) <= 0) {
+          /* Running the same of higher version */
+          if (get_cfg()->update.update_to_any_version == 0) {
+            ctx->status_msg = "Device has the same or more recent version";
+            LOG(LL_INFO, (ctx->status_msg));
+            return 1; /* Not an error */
+          } else {
+            LOG(LL_WARN, ("Downgrade, but update to any version enabled"));
+          }
+        }
+
+        context_clear_file_info(ctx);
+        set_status(ctx, US_WAITING_FILE_HEADER);
+      } /* fall through */
+      case US_WAITING_FILE_HEADER: {
+        if ((ret = fill_zip_header(ctx)) <= 0) {
+          if (ret == 0) {
+            context_save_unprocessed(ctx);
+          }
+          return ret;
+        }
+
+        if (strcmp(ctx->file_info.file_name, ctx->fw_part.file_name) == 0) {
+          LOG(LL_DEBUG, ("Initializing FW writer"));
+          ret = prepare_to_write(ctx, &ctx->fw_part);
+        } else if (strcmp(ctx->file_info.file_name, ctx->fs_part.file_name) ==
+                   0) {
+          LOG(LL_DEBUG, ("Initializing FS writer"));
+          ret = prepare_to_write(ctx, &ctx->fs_part);
+        } else {
+          /* We need only fw & fs files, the rest just send to /dev/null */
+          set_status(ctx, US_SKIPPING_DATA);
+          break;
+        }
+
+        if (ret < 0) {
+          return ret;
+        }
+
+        set_status(ctx, US_WAITING_FILE);
+      } /* fall through */
+      case US_WAITING_FILE: {
+        if ((ret = process_file_data(ctx, 0)) <= 0) {
+          return ret;
+        }
+
+        if (finalize_write(ctx) < 0) {
+          return -1;
+        }
+        context_clear_file_info(ctx);
+
+        ret = have_more_files(ctx);
+        LOG(LL_DEBUG, ("More files: %d", ret));
+
+        if (ret > 0) {
+          update_rboot_config(ctx);
+          ctx->need_reboot = 1;
+          ctx->status_msg = "Update completed successfully";
+          set_status(ctx, US_FINISHED);
+        } else {
+          set_status(ctx, US_WAITING_FILE_HEADER);
+          break;
+        }
+
+        return ret;
       }
-      break;
-    }
+      case US_SKIPPING_DATA: {
+        if ((ret = process_file_data(ctx, 1)) <= 0) {
+          return ret;
+        }
 
-    case MG_EV_CLOSE: {
-      if (nc == s_current_connection) {
-        s_current_connection = NULL;
-      }
-      break;
-    }
-
-    case MG_EV_HTTP_REPLY: {
-      nc->flags |= MG_F_CLOSE_IMMEDIATELY;
-      struct http_message *hm = (struct http_message *) ev_data;
-      free(s_manifest);
-      s_manifest = calloc(1, hm->body.len + 1);
-      memcpy(s_manifest, hm->body.p, hm->body.len);
-      LOG(LL_DEBUG, ("Metadata size: %d", (int) hm->body.len));
-      set_download_status(DS_COMPLETED);
-      break;
-    }
-
-    case MG_EV_RECV: {
-      s_last_received_time = system_get_time();
-      if (s_update_status == US_WAITING_METADATA) {
-        /* Metadata is processed in MS_EV_HTTP_REPLY */
+        context_clear_file_info(ctx);
+        set_status(ctx, US_SKIPPING_DESCRIPTOR);
         break;
       }
-      struct http_message hm;
-      struct mbuf *io = &nc->recv_mbuf;
-      int parsed;
-      s_current_received += (int) nc->recv_mbuf.len;
-      LOG(LL_DEBUG, ("fw_updater: received %d bytes, %d bytes total",
-                     (int) nc->recv_mbuf.len, s_current_received));
+      case US_SKIPPING_DESCRIPTOR: {
+        int has_descriptor = ctx->file_info.has_descriptor;
+        LOG(LL_DEBUG, ("Has descriptor : %d", has_descriptor));
+        context_clear_file_info(ctx);
+        ctx->file_info.has_descriptor = 0;
+        if (has_descriptor) {
+          /* If file has descriptor we have to skip 12 bytes after its body */
+          ctx->file_info.file_size = ZIP_FILE_DESCRIPTOR_SIZE;
+          set_status(ctx, US_SKIPPING_DATA);
+        } else {
+          set_status(ctx, US_WAITING_FILE_HEADER);
+        }
 
-      if (s_file_size == 0) {
-        memset(&hm, 0, sizeof(hm));
-        /* Waiting for Content-Length */
-        if ((parsed = mg_parse_http(io->buf, io->len, &hm, 0)) > 0) {
-          if (hm.body.len != 0) {
-            LOG(LL_DEBUG, ("fw_updater: file size: %d", (int) hm.body.len));
-            if (hm.body.len == (size_t) ~0) {
-              LOG(LL_DEBUG,
-                  ("Invalid content-length, perhaps chunked-encoding"));
-              download_error(nc);
-              break;
-            } else {
-              s_file_size = hm.body.len;
-            }
-            mbuf_remove(io, parsed);
+        context_save_unprocessed(ctx);
+        break;
+      }
+      case US_FINISHED: {
+        /* After receiving manifest, fw & fs just skipping all data */
+        context_remove_data(ctx, ctx->data_len);
+        return 1;
+      }
+    }
+  }
+  return -1; /* This should never happen, but we have to shut up compiler */
+}
+
+static void reboot_timer_cb(void *arg) {
+  (void) arg;
+  LOG(LL_DEBUG, ("Rebooting"));
+  device_reboot();
+}
+
+static void schedule_reboot() {
+  LOG(LL_DEBUG, ("Scheduling reboot"));
+  static os_timer_t reboot_timer;
+  os_timer_setfn(&reboot_timer, reboot_timer_cb, NULL);
+  os_timer_arm(&reboot_timer, 1000, 0);
+}
+
+static int is_update_finished(struct update_context *ctx) {
+  return ctx->update_status == US_FINISHED;
+}
+
+static int is_reboot_requred(struct update_context *ctx) {
+  return ctx->need_reboot;
+}
+
+static int is_update_in_progress() {
+  return s_ctx != NULL;
+}
+
+static void handle_update_post_req(struct mg_connection *c, int ev, void *p) {
+  switch (ev) {
+    case MG_EV_HTTP_MULTIPART_REQUEST: {
+      if (is_update_in_progress()) {
+        mg_printf(c,
+                  "HTTP/1.1 400 Bad request\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "Connection: close\r\n\r\n"
+                  "Update already in progress\r\n");
+        LOG(LL_ERROR, ("Update already in progress"));
+        c->flags |= MG_F_SEND_AND_CLOSE;
+      } else {
+        LOG(LL_INFO, ("Updating FW"));
+        c->user_data = context_create();
+      }
+      break;
+    }
+    case MG_EV_HTTP_PART_DATA: {
+      struct update_context *ctx = (struct update_context *) c->user_data;
+      struct mg_http_multipart_part *mp = (struct mg_http_multipart_part *) p;
+      LOG(LL_DEBUG, ("Got %u bytes", mp->data.len))
+
+      /*
+       * We can have NULL here if client sends data after completion of
+       * update process
+       */
+      if (ctx != NULL && !is_update_finished(ctx)) {
+        ctx->result = updater_process(ctx, mp->data.p, mp->data.len);
+        LOG(LL_DEBUG, ("updater_process res: %d", ctx->result));
+        if (ctx->result != 0) {
+          set_status(ctx, US_FINISHED);
+          /* Don't close connection just yet, not all browsers like that. */
+        }
+      }
+      break;
+    }
+    case MG_EV_HTTP_PART_END: {
+      struct update_context *ctx = (struct update_context *) c->user_data;
+      struct mg_http_multipart_part *mp = (struct mg_http_multipart_part *) p;
+      LOG(LL_DEBUG, ("MG_EV_HTTP_PART_END: %p %p %d", ctx, mp, mp->status));
+      /* Whatever happens, this is the last thing we do. */
+      c->flags |= MG_F_SEND_AND_CLOSE;
+
+      if (ctx == NULL) break;
+      if (mp->status < 0) {
+        /* mp->status < 0 means connection is dead, do not send reply */
+        LOG(LL_ERROR, ("Update terminated unexpectedly"));
+        break;
+      } else {
+        if (is_update_finished(ctx)) {
+          mg_printf(c,
+                    "HTTP/1.1 %s\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n"
+                    "%s\r\n",
+                    ctx->result > 0 ? "200 OK" : "400 Bad request",
+                    ctx->status_msg ? ctx->status_msg : "Unknown error");
+          LOG(LL_ERROR, ("Update result: %d %s", ctx->result,
+                         ctx->status_msg ? ctx->status_msg : "Unknown error"));
+          if (is_reboot_requred(ctx)) {
+            LOG(LL_INFO, ("Rebooting device"));
+            schedule_reboot();
           }
+        } else {
+          mg_printf(c,
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n"
+                    "%s\n",
+                    "Reached the end without finishing update");
+          LOG(LL_ERROR, ("Reached the end without finishing update"));
         }
       }
 
-      if (s_file_size != 0) {
-        if (!s_area_prepared) {
-          /*
-           * Possibly, it is better to erase on demand,
-           * sector-by-sector. On another hand, erasing of 500Kb takes
-           * ~1-2 sec but simplifies code
-           */
-          LOG(LL_DEBUG, ("Erasing flash"));
-          if (prepare_area(s_current_write_address, s_file_size) != 0) {
-            download_error(nc);
-            return;
-          }
-          LOG(LL_DEBUG, ("Flash ready"));
-          s_area_prepared = 1;
-          s_written = 0;
-        }
+      context_release(ctx);
+      free(ctx);
+      s_ctx = NULL;
+      c->user_data = NULL;
+    } break;
+  }
+}
 
-        /* Write operation must be 4-bytes aligned */
-        int to_write = io->len & -4;
+static int notify_js(enum js_update_status us, const char *info) {
+  if (!v7_is_undefined(s_updater_notify_cb)) {
+    if (info == NULL) {
+      sj_invoke_cb1(s_v7, s_updater_notify_cb, v7_mk_number(us));
+    } else {
+      sj_invoke_cb2(s_v7, s_updater_notify_cb, v7_mk_number(us),
+                    v7_mk_string(s_v7, info, ~0, 1));
+    };
 
-        fprintf(stderr, ".");
+    return 1;
+  }
 
-        LOG(LL_DEBUG, ("Writing %d @ 0x%X", to_write,
-                       s_current_write_address + s_written));
-        if (spi_flash_write(s_current_write_address + s_written,
-                            (uint32_t *) io->buf, to_write) != 0) {
-          LOG(LL_ERROR, ("Cannot write to address %X",
-                         s_current_write_address + s_written));
-          download_error(nc);
+  return 0;
+}
+
+static void fw_download_ev_handler(struct mg_connection *c, int ev, void *p) {
+  struct mbuf *io = &c->recv_mbuf;
+  struct update_context *ctx = (struct update_context *) c->user_data;
+  (void) p;
+
+  switch (ev) {
+    case MG_EV_RECV: {
+      if (ctx->archive_size == 0) {
+        LOG(LL_DEBUG, ("Looking for HTTP header"));
+        struct http_message hm;
+        int parsed = mg_parse_http(io->buf, io->len, &hm, 0);
+        if (parsed < 0) {
           return;
         }
-
-        mbuf_remove(io, to_write);
-        s_written += to_write;
-        int rest = s_file_size - s_written;
-        LOG(LL_DEBUG, ("Write done, written %d of %d (%d to go)", s_written,
-                       s_file_size, rest));
-
-        if (rest != 0 && rest < 4) {
-          /* Filesize % 4 != 0 and we write last chunk */
-          uint8_t align_buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-          LOG(LL_DEBUG, ("Writing end of file (%d dytes) to %X", rest,
-                         s_current_write_address + s_written));
-          memcpy(align_buf, io->buf, rest);
-          if (spi_flash_write(s_current_write_address + s_written,
-                              (uint32_t *) align_buf, 4) != 0) {
-            LOG(LL_ERROR, ("Cannot write to address %X",
-                           s_current_write_address + s_written));
-            download_error(nc);
-            return;
+        if (hm.body.len != 0) {
+          LOG(LL_DEBUG, ("HTTP header: file size: %d", (int) hm.body.len));
+          if (hm.body.len == (size_t) ~0) {
+            LOG(LL_ERROR, ("Invalid content-length, perhaps chunked-encoding"));
+            ctx->status_msg =
+                "Invalid content-length, perhaps chunked-encoding";
+            c->flags |= MG_F_CLOSE_IMMEDIATELY;
+            break;
+          } else {
+            ctx->archive_size = hm.body.len;
           }
 
-          mbuf_remove(io, rest);
-          s_written += rest;
+          mbuf_remove(io, parsed);
         }
       }
 
-      if (s_written == s_file_size) {
-        LOG(LL_INFO, ("New firmware written (%d bytes)", s_written));
-        set_download_status(DS_COMPLETED);
-        nc->flags |= MG_F_CLOSE_IMMEDIATELY;
-      }
+      if (io->len != 0) {
+        int res = updater_process(ctx, io->buf, io->len);
+        LOG(LL_DEBUG, ("Processed %d bytes, result: %d", (int) io->len, res));
 
-      /* We'll see these bytes again next time. */
-      s_current_received -= io->len;
+        mbuf_remove(io, io->len);
 
-      break;
-    }
-  }
-}
-
-void update_timer_cb(void *arg) {
-  (void) arg;
-  switch (s_update_status) {
-    case US_NOT_STARTED:
-    case US_INITED: {
-      /* Starting with loading manifest */
-      LOG(LL_DEBUG, ("Loading manifest"));
-      do_http_connect(s_manifest_url);
-      set_update_status(US_WAITING_METADATA);
-      set_download_status(DS_IN_PROGRESS);
-      break;
-    }
-
-    case US_WAITING_METADATA: {
-      if (s_download_status == DS_IN_PROGRESS) {
-        verify_timeout();
-      } else if (s_download_status == DS_COMPLETED) {
-        set_update_status(US_GOT_METADATA);
-      } else {
-        set_update_status(US_ERROR);
-      }
-      break;
-    }
-
-    case US_GOT_METADATA: {
-      struct json_token *toks = parse_json2(s_manifest, strlen(s_manifest));
-      if (toks == NULL) {
-        LOG(LL_DEBUG, ("Cannot parse manifest (len=%d)\n%s", strlen(s_manifest),
-                       s_manifest));
-        goto error;
-      }
-
-      if (!sj_conf_get_str(toks, "version", &s_new_fw_version)) {
-        goto error;
-      }
-
-      LOG(LL_INFO, ("Version %s is available, current version %s",
-                    s_new_fw_version, build_version));
-      /*
-       * build_version & s_new_fw_version is a date in
-       * %Y%m%d%H%M%S format, so, we can lex compare them
-       */
-      if (strcmp(s_new_fw_version, build_version) > 0) {
-        LOG(LL_INFO, ("Starting update to %s", s_new_fw_version));
-      } else {
-        LOG(LL_INFO, ("Nothing to do, exiting update"));
-        set_update_status(US_NOTHING_TODO);
-        goto cleanup;
-      }
-
-      s_new_rom_number = get_current_rom() == 1 ? 0 : 1;
-      LOG(LL_DEBUG, ("ROM to write: %d", s_new_rom_number));
-
-      if (!sj_conf_get_str(toks, "parts.fw.src", &s_fw_url)) {
-        goto error;
-      }
-      LOG(LL_DEBUG, ("FW url: %s", s_fw_url));
-
-      if (!sj_conf_get_str(toks, "parts.fs.src", &s_fs_url)) {
-        goto error;
-      }
-      LOG(LL_DEBUG, ("FS url: %s", s_fs_url));
-
-      if (!sj_conf_get_str(toks, "parts.fw.cs_sha1", &s_fw_checksum)) {
-        goto error;
-      }
-      LOG(LL_DEBUG, ("FW checksum: %s", s_fw_checksum));
-
-      if (!sj_conf_get_str(toks, "parts.fs.cs_sha1", &s_fs_checksum)) {
-        goto error;
-      }
-      LOG(LL_DEBUG, ("FS checksum: %s", s_fs_checksum));
-
-      s_file_size = s_current_received = s_area_prepared = 0;
-      s_current_write_address = get_fw_addr(s_new_rom_number);
-      LOG(LL_DEBUG, ("Address to write ROM: %X", s_current_write_address));
-
-      LOG(LL_INFO, ("Loading %s", s_fw_url));
-      do_http_connect_by_uri(s_manifest_url, s_fw_url);
-      set_update_status(US_DOWNLOADING_FW);
-      set_download_status(DS_IN_PROGRESS);
-      goto cleanup;
-
-    error:
-      LOG(LL_ERROR, ("Invalid manifest file"));
-      set_update_status(US_ERROR);
-
-    cleanup:
-      free(toks);
-      break;
-    }
-
-    case US_DOWNLOADING_FW: {
-      if (s_download_status == DS_IN_PROGRESS) {
-        verify_timeout();
-      } else if (s_download_status == DS_COMPLETED) {
-        if (verify_checksum(get_fw_addr(s_new_rom_number), s_file_size,
-                            s_fw_checksum) != 0) {
-          set_update_status(US_ERROR);
-        } else {
-          /* Start FS download */
-          LOG(LL_DEBUG, ("Loading %s", s_fs_url));
-          s_file_size = s_current_received = s_area_prepared = 0;
-          s_current_write_address = get_fs_addr(s_new_rom_number);
-          do_http_connect_by_uri(s_manifest_url, s_fs_url);
-          set_update_status(US_DOWNLOADING_FS);
-          set_download_status(DS_IN_PROGRESS);
-        }
-      } else {
-        set_update_status(DS_ERROR);
-      }
-    }
-
-    case US_DOWNLOADING_FS: {
-      if (s_download_status == DS_IN_PROGRESS) {
-        verify_timeout();
-      } else if (s_download_status == DS_COMPLETED) {
-        if (verify_checksum(get_fs_addr(s_new_rom_number), s_file_size,
-                            s_fs_checksum) != 0) {
-          set_update_status(US_ERROR);
-        } else {
-          set_update_status(US_COMPLETED);
+        if (res == 0) {
+          /* Need more data, everything is OK */
+          break;
         }
 
-      } else {
-        set_update_status(US_ERROR);
+        if (res > 0) {
+          if (!is_update_finished(ctx)) {
+            /* Update terminated, but not because of error */
+            notify_js(UJS_NOTHING_TODO, NULL);
+            sj_clubby_send_reply(s_clubby_reply, 0, ctx->status_msg);
+          } else {
+            /* update ok */
+            int len;
+            char *upd_data = sj_clubby_repl_to_bytes(s_clubby_reply, &len);
+            FILE *tmp_file = fopen(UPDATER_TEMP_FILE_NAME, "w");
+            if (tmp_file == NULL || upd_data == NULL) {
+              /* There is nothing we can do */
+              LOG(LL_ERROR, ("Cannot save update status"));
+            } else {
+              fwrite(upd_data, 1, len, tmp_file);
+              fclose(tmp_file);
+            }
+            LOG(LL_INFO, ("Update completed successfully"));
+          }
+        } else if (res < 0) {
+          /* Error */
+          notify_js(UJS_ERROR, NULL);
+          sj_clubby_send_reply(s_clubby_reply, 1, ctx->status_msg);
+        }
+
+        set_status(ctx, US_FINISHED);
+        c->flags |= MG_F_CLOSE_IMMEDIATELY;
       }
       break;
     }
+    case MG_EV_CLOSE: {
+      if (ctx != NULL) {
+        if (!is_update_finished(ctx)) {
+          /* Connection was terminated by server */
+          notify_js(UJS_ERROR, NULL);
+          sj_clubby_send_reply(s_clubby_reply, 1, "Update failed");
+        } else if (is_reboot_requred(ctx) && !notify_js(UJS_COMPLETED, NULL)) {
+          /*
+           * Conection is closed by updater, rebooting if required
+           * and allowed (by JS)
+           */
+          LOG(LL_INFO, ("Rebooting device"));
+          schedule_reboot();
+        }
 
-    case US_COMPLETED: {
-      disconnect();
+        if (s_clubby_reply) {
+          sj_clubby_free_reply(s_clubby_reply);
+          s_clubby_reply = NULL;
+        }
 
-      int len;
-      char *upd_data = sj_clubby_repl_to_bytes(s_clubby_reply, &len);
-      FILE *tmp_file = fopen(UPDATER_TEMP_FILE_NAME, "w");
-      if (tmp_file == NULL || upd_data == NULL) {
-        /* There is nothing we can do */
-        LOG(LL_ERROR, ("Cannot save update status"));
-      } else {
-        fwrite(upd_data, 1, len, tmp_file);
-        fclose(tmp_file);
+        context_release(ctx);
+        free(ctx);
+        s_ctx = NULL;
+        c->user_data = NULL;
       }
 
-      LOG(LL_INFO,
-          ("Version %s downloaded, restarting system", s_new_fw_version));
-      os_timer_disarm(&s_update_timer);
-
-      set_boot_params(s_new_rom_number, rboot_get_current_rom());
-
-      if (!notify_js(US_COMPLETED, NULL)) {
-        schedule_reboot();
-      }
-
-      set_update_status(US_NOT_STARTED);
       break;
-    }
-
-    case US_NOTHING_TODO: {
-      disconnect();
-      os_timer_disarm(&s_update_timer);
-      /* Leave this status to support UI stuff */
-      notify_js(US_NOTHING_TODO, NULL);
-      sj_clubby_send_reply(s_clubby_reply, 0, "Already updated");
-      break;
-    }
-
-    case US_ERROR: {
-      disconnect();
-      LOG(LL_ERROR, ("Update failed"));
-      os_timer_disarm(&s_update_timer);
-      notify_js(US_ERROR, NULL);
-      sj_clubby_send_reply(s_clubby_reply, 1, "Update failed");
     }
   }
 }
 
-enum update_status update_get_status(void) {
-  return s_update_status;
-}
+static int do_http_connect(const char *url) {
+  LOG(LL_DEBUG, ("Connecting to: %s", url));
 
-int is_in_progress() {
-  int ret = (s_update_status != US_NOT_STARTED &&
-             s_update_status != US_NOTHING_TODO && s_update_status != US_ERROR);
-  LOG(LL_DEBUG, ("In progress: %d", ret));
-  return ret;
-}
+  struct mg_connection *c =
+      mg_connect_http(&sj_mgr, fw_download_ev_handler, url, NULL, NULL);
 
-void update_start(const char *manifest_url) {
-  if (is_in_progress()) {
-    LOG(LL_INFO, ("Update already in progress"));
-    return;
+  if (c == NULL) {
+    LOG(LL_ERROR, ("Failed to connect to %s", url));
+    return -1;
   }
 
-  free(s_manifest_url);
+  c->user_data = s_ctx;
 
-  if (manifest_url != NULL) {
-    s_manifest_url = strdup(manifest_url);
-  } else {
-    /* Fallback to cfg-stored manifest url. Debug only */
-    s_manifest_url = strdup(get_cfg()->update.manifest_url);
+#ifdef SSL_KRYPTON
+  if (memcmp(url, "https", 5) == 0 && get_cfg()->tls.enable) {
+    char *ca_file = get_cfg()->tls.ca_file;
+    char *server_name = get_cfg()->tls.server_name;
+    mg_set_ssl(c, NULL, ca_file);
+    if (server_name != NULL) {
+      SSL_CTX_kr_set_verify_name(c->ssl_ctx, server_name);
+    }
   }
+#endif
 
-  set_update_status(US_INITED);
-  s_last_received_time = system_get_time();
-  os_timer_disarm(&s_update_timer);
-  os_timer_setfn(&s_update_timer, update_timer_cb, NULL);
-  os_timer_arm(&s_update_timer, 1000, 1);
-}
-
-void set_boot_params(uint8_t new_rom, uint8_t prev_rom) {
-  rboot_config rc = rboot_get_config();
-  rc.previous_rom = prev_rom;
-  rc.current_rom = new_rom;
-  /*
-   * using two flags - is_first_boot & fw_updated
-   * we need them to manage fw fallbacks
-   */
-  rc.is_first_boot = 1;
-  rc.fw_updated = 1;
-  rc.boot_attempts = 0;
-  rboot_set_config(&rc);
+  return 1;
 }
 
 static int file_copy(spiffs *old_fs, char *file_name) {
-  LOG(LL_DEBUG, ("Copying %s", file_name));
+  LOG(LL_INFO, ("Copying %s", file_name));
   int ret = 0;
   FILE *f = NULL;
   spiffs_stat stat;
@@ -738,7 +1155,7 @@ static struct clubby_event *load_clubby_reply(spiffs *fs) {
     goto cleanup;
   }
 
-  ret = sj_clubby_bytes_to_repl(reply_str, st.size);
+  ret = sj_clubby_bytes_to_reply(reply_str, st.size);
   if (ret == NULL) {
     LOG(LL_ERROR, ("Cannot create clubby reply"));
     goto cleanup;
@@ -772,12 +1189,6 @@ static int load_data_from_old_fs(uint32_t old_fs_addr) {
    * old one
    */
 
-  /* Copy predefined overrides files */
-  if (!file_copy(&old_fs, OVERRIDES_JSON_FILE)) {
-    goto cleanup;
-  }
-
-  /* Copy files with name started with FILE_UPDATE_PREF ("imp_" by default) */
   dir_ptr = SPIFFS_opendir(&old_fs, ".", &dir);
   if (dir_ptr == NULL) {
     LOG(LL_ERROR, ("Failed to open root directory"));
@@ -786,8 +1197,11 @@ static int load_data_from_old_fs(uint32_t old_fs_addr) {
 
   struct spiffs_dirent de, *de_ptr;
   while ((de_ptr = SPIFFS_readdir(dir_ptr, &de)) != NULL) {
-    if (memcmp(de_ptr->name, FILE_UPDATE_PREF, strlen(FILE_UPDATE_PREF)) == 0) {
+    struct stat st;
+    if (stat((const char *) de_ptr->name, &st) != 0) {
+      /* File not found on the new fs, copy. */
       if (!file_copy(&old_fs, (char *) de_ptr->name)) {
+        LOG(LL_ERROR, ("Error copying!"));
         goto cleanup;
       }
     }
@@ -806,15 +1220,6 @@ cleanup:
   SPIFFS_unmount(&old_fs);
 
   return ret;
-}
-
-static void reboot_timer_cb(void *arg) {
-  (void) arg;
-  /*
-   * just reboot system, fw boot is not commited so, rboot will do actual
-   * rollback
-   */
-  system_restart();
 }
 
 int finish_update() {
@@ -852,29 +1257,66 @@ int finish_update() {
   return 1;
 }
 
-void schedule_reboot() {
-  /*
-   * For unknown reason, calling system_restart() from user_init/system_init_cb
-   * couses nothing but core dump. So, arming timer for reboot
-   * TODO(alashkin): figure out why so
-   */
-  os_timer_setfn(&s_reboot_timer, reboot_timer_cb, NULL);
-  os_timer_arm(&s_reboot_timer, 1000, 0);
-}
+/*
+ * Example of notification function:
+ * function upd(ev, url) {
+ *      if (ev == Sys.updater.GOT_REQUEST) {
+ *         print("Starting update from", url);
+ *         Sys.updater.start(url);
+ *       }  else if(ev == Sys.updater.NOTHING_TODO) {
+ *         print("No need to update");
+ *       } else if(ev == Sys.updater.FAILED) {
+ *         print("Update failed");
+ *       } else if(ev == Sys.updater.COMPLETED) {
+ *         print("Update completed");
+ *         Sys.reboot();
+ *       }
+ * }
+ */
 
-static int notify_js(enum update_status us, const char *info) {
-  if (!v7_is_undefined(s_updater_notify_cb)) {
-    if (info == NULL) {
-      sj_invoke_cb1(s_v7, s_updater_notify_cb, v7_mk_number(us));
-    } else {
-      sj_invoke_cb2(s_v7, s_updater_notify_cb, v7_mk_number(us),
-                    v7_mk_string(s_v7, info, ~0, 1));
-    };
-
-    return 1;
+static enum v7_err Updater_notify(struct v7 *v7, v7_val_t *res) {
+  v7_val_t cb = v7_arg(v7, 0);
+  if (!v7_is_callable(v7, cb)) {
+    printf("Invalid arguments\n");
+    *res = v7_mk_boolean(0);
+    return V7_OK;
   }
 
-  return 0;
+  s_updater_notify_cb = cb;
+
+  *res = v7_mk_boolean(1);
+  return V7_OK;
+}
+
+int start_update_download(struct update_context *ctx, const char *url) {
+  LOG(LL_INFO, ("Updating FW"));
+
+  if (do_http_connect(url) < 0) {
+    ctx->status_msg = "Failed to connect update server";
+    return -1;
+  }
+
+  return 1;
+}
+
+static enum v7_err Updater_startupdate(struct v7 *v7, v7_val_t *res) {
+  enum v7_err rcode = V7_OK;
+
+  v7_val_t manifest_url_v = v7_arg(v7, 0);
+  if (!v7_is_string(manifest_url_v)) {
+    rcode = v7_throwf(v7, "Error", "URL is not a string");
+  } else {
+    struct update_context *ctx = context_create();
+    if (ctx == NULL) {
+      rcode = v7_throwf(v7, "Error", "Failed to init updater");
+    }
+    if (start_update_download(ctx, v7_to_cstring(v7, &manifest_url_v)) < 0) {
+      rcode = v7_throwf(v7, "Error", ctx->status_msg);
+    }
+  }
+
+  *res = v7_mk_boolean(rcode == V7_OK);
+  return rcode;
 }
 
 static void handle_clubby_ready(struct clubby_event *evt, void *user_data) {
@@ -901,10 +1343,12 @@ static void handle_clubby_ready(struct clubby_event *evt, void *user_data) {
   };
 }
 
-static void handle_clubby_update(struct clubby_event *evt, void *user_data) {
+static void handle_update_req(struct clubby_event *evt, void *user_data) {
   (void) user_data;
   LOG(LL_DEBUG, ("Command received: %.*s", evt->request.cmd_body->len,
                  evt->request.cmd_body->ptr));
+
+  const char *reply = "Malformed request";
 
   struct json_token *args = find_json_token(evt->request.cmd_body, "args");
   if (args == NULL || args->type != JSON_TYPE_OBJECT) {
@@ -924,7 +1368,7 @@ static void handle_clubby_update(struct clubby_event *evt, void *user_data) {
     goto bad_request;
   }
 
-  LOG(LL_DEBUG, ("manifest url: %.*s", blob_url->len, blob_url->ptr));
+  LOG(LL_DEBUG, ("zip url: %.*s", blob_url->len, blob_url->ptr));
 
   sj_clubby_free_reply(s_clubby_reply);
   s_clubby_reply = sj_clubby_create_reply(evt);
@@ -933,86 +1377,34 @@ static void handle_clubby_update(struct clubby_event *evt, void *user_data) {
    * If user setup callback for updater, just call it.
    * User can start update with Sys.updater.start()
    */
-  if (!is_in_progress()) {
-    char *manifest_url = calloc(1, blob_url->len + 1);
-    if (manifest_url == NULL) {
-      LOG(LL_ERROR, ("Out of memory"));
-      return;
-    }
-
-    memcpy(manifest_url, blob_url->ptr, blob_url->len);
-
-    if (!notify_js(US_NOT_STARTED, manifest_url)) {
-      update_start(manifest_url);
-    }
-
-    free(manifest_url);
+  if (is_update_in_progress()) {
+    reply = "Update already in progress";
   }
+
+  char *zip_url = calloc(1, blob_url->len + 1);
+  if (zip_url == NULL) {
+    LOG(LL_ERROR, ("Out of memory"));
+    return;
+  }
+
+  memcpy(zip_url, blob_url->ptr, blob_url->len);
+
+  if (!notify_js(UJS_GOT_REQUEST, zip_url)) {
+    struct update_context *ctx = context_create();
+    if (ctx == NULL) {
+      reply = "Failed init updater";
+    } else if (start_update_download(ctx, zip_url) < 0) {
+      reply = ctx->status_msg;
+    }
+  }
+
+  free(zip_url);
+
   return;
 
 bad_request:
-  sj_clubby_send_reply(evt, 1, "malformed request");
-}
-
-static enum v7_err Updater_startupdate(struct v7 *v7, v7_val_t *res) {
-  LOG(LL_DEBUG, ("Starting update"));
-  v7_val_t manifest_url_v = v7_arg(v7, 0);
-  if (v7_is_undefined(manifest_url_v)) {
-    /* Using default manifest address */
-    update_start(NULL);
-  } else if (v7_is_string(manifest_url_v)) {
-    update_start(v7_to_cstring(v7, &manifest_url_v));
-  } else {
-    printf("Invalid arguments\n");
-    *res = v7_mk_boolean(0);
-    return V7_OK;
-  }
-
-  *res = v7_mk_boolean(1);
-  return V7_OK;
-}
-
-/*
- * Example of notification function:
- * function upd(ev, url) {
- *      if (ev == Sys.updater.GOT_REQUEST) {
- *         print("Starting update from", url);
- *         Sys.updater.start(url);
- *       }  else if(ev == Sys.updater.NOTHING_TODO) {
- *         print("No need to update");
- *       } else if(ev == Sys.updater.FAILED) {
- *         print("Update failed");
- *       } else if(ev == Sys.updater.COMPLETED) {
- *         print("Update completed");
- *         Sys.reboot();
- *       }
- * }
- */
-
-static enum v7_err Updater_notify(struct v7 *v7, v7_val_t *res) {
-  v7_val_t cb = v7_arg(v7, 0);
-  if (!v7_is_callable(v7, cb)) {
-    printf("Invalid arguments\n");
-    *res = v7_mk_boolean(0);
-    return V7_OK;
-  }
-
-  if (!v7_is_undefined(s_updater_notify_cb)) {
-    v7_disown(v7, &s_updater_notify_cb);
-  }
-
-  s_updater_notify_cb = cb;
-  v7_own(v7, &s_updater_notify_cb);
-
-  *res = v7_mk_boolean(1);
-  return V7_OK;
-}
-
-static void handle_update_req(struct mg_connection *c, int ev, void *p) {
-  (void) c;
-  (void) ev;
-  (void) p;
-  LOG(LL_DEBUG, ("Incoming update request"));
+  LOG(LL_ERROR, ("Failed to start update: %s", reply));
+  sj_clubby_send_reply(evt, 1, reply);
 }
 
 void init_updater(struct v7 *v7) {
@@ -1020,34 +1412,33 @@ void init_updater(struct v7 *v7) {
   v7_val_t updater = v7_mk_object(v7);
   v7_val_t sys = v7_get(v7, v7_get_global(v7), "Sys", ~0);
   s_updater_notify_cb = v7_mk_undefined();
+  v7_own(v7, &s_updater_notify_cb);
 
   v7_def(v7, sys, "updater", ~0, V7_DESC_ENUMERABLE(0), updater);
-  v7_set_method(v7, updater, "start", Updater_startupdate);
   v7_set_method(v7, updater, "notify", Updater_notify);
+  v7_set_method(v7, updater, "start", Updater_startupdate);
 
   v7_def(s_v7, updater, "GOT_REQUEST", ~0,
          (V7_DESC_WRITABLE(0) | V7_DESC_CONFIGURABLE(0)),
-         v7_mk_number(US_NOT_STARTED));
+         v7_mk_number(UJS_GOT_REQUEST));
 
   v7_def(s_v7, updater, "COMPLETED", ~0,
          (V7_DESC_WRITABLE(0) | V7_DESC_CONFIGURABLE(0)),
-         v7_mk_number(US_COMPLETED));
+         v7_mk_number(UJS_COMPLETED));
 
   v7_def(s_v7, updater, "NOTHING_TODO", ~0,
          (V7_DESC_WRITABLE(0) | V7_DESC_CONFIGURABLE(0)),
-         v7_mk_number(US_NOTHING_TODO));
+         v7_mk_number(UJS_NOTHING_TODO));
 
   v7_def(s_v7, updater, "FAILED", ~0,
          (V7_DESC_WRITABLE(0) | V7_DESC_CONFIGURABLE(0)),
-         v7_mk_number(US_ERROR));
+         v7_mk_number(UJS_ERROR));
 
-  sj_clubby_register_global_command("/v1/SWUpdate.Update", handle_clubby_update,
+  sj_clubby_register_global_command("/v1/SWUpdate.Update", handle_update_req,
                                     NULL);
 
   sj_clubby_register_global_command(clubby_cmd_ready, handle_clubby_ready,
                                     NULL);
 
-  device_register_http_endpoint("/update", handle_update_req);
+  device_register_http_endpoint("/update", handle_update_post_req);
 }
-
-#endif /* DISABLE_OTA */

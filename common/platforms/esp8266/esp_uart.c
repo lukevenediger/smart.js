@@ -60,7 +60,7 @@ IRAM static int cts(int uart_no) {
   return (READ_PERI_REG(UART_STATUS(uart_no)) & UART_CTSN) ? 1 : 0;
 }
 
-IRAM static int rx_fifo_len(int uart_no) {
+IRAM int rx_fifo_len(int uart_no) {
   return READ_PERI_REG(UART_STATUS(uart_no)) & 0xff;
 }
 
@@ -68,7 +68,7 @@ IRAM static int rx_byte(int uart_no) {
   return READ_PERI_REG(UART_FIFO(uart_no)) & 0xff;
 }
 
-IRAM static int tx_fifo_len(int uart_no) {
+IRAM int tx_fifo_len(int uart_no) {
   return (READ_PERI_REG(UART_STATUS(uart_no)) >> 16) & 0xff;
 }
 
@@ -78,7 +78,9 @@ IRAM static void tx_byte(int uart_no, uint8_t byte) {
 
 IRAM NOINSTR static void esp_handle_uart_int(struct esp_uart_state *us) {
   const int uart_no = us->cfg->uart_no;
-  const unsigned int int_st = READ_PERI_REG(UART_INT_ST(uart_no));
+  /* Since both UARTs use the same int, we need to apply the mask manually. */
+  const unsigned int int_st = READ_PERI_REG(UART_INT_ST(uart_no)) &
+                              READ_PERI_REG(UART_INT_ENA(uart_no));
   if (int_st == 0) return;
   us->stats.ints++;
   if (int_st & UART_RXFIFO_OVF_INT_ST) us->stats.rx_overflows++;
@@ -86,9 +88,11 @@ IRAM NOINSTR static void esp_handle_uart_int(struct esp_uart_state *us) {
     if (cts(uart_no) != 0 && tx_fifo_len(uart_no) > 0) us->stats.tx_throttles++;
   }
   if (int_st & (UART_RX_INTS | UART_TX_INTS)) {
+    if (int_st & UART_RX_INTS) us->stats.rx_ints++;
+    if (int_st & UART_TX_INTS) us->stats.tx_ints++;
     /* Wake up the processor and disable TX and RX ints until it runs. */
     WRITE_PERI_REG(UART_INT_ENA(uart_no), UART_INFO_INTS);
-    esp_uart_dispatch_signal_from_isr(uart_no);
+    us->cfg->dispatch_cb(uart_no);
   }
   WRITE_PERI_REG(UART_INT_CLR(uart_no), int_st);
 }
@@ -142,7 +146,7 @@ IRAM int esp_uart_dispatch_rx_top(int uart_no) {
   }
   int rfl = rx_fifo_len(uart_no);
   if (rfl < us->cfg->rx_fifo_full_thresh) {
-    WRITE_PERI_REG(UART_INT_CLR(uart_no), UART_RX_INTS);
+    CLEAR_PERI_REG_MASK(UART_INT_CLR(uart_no), UART_RX_INTS);
   }
   return rfl == 0;
 }
@@ -200,16 +204,19 @@ void esp_uart_print_status(void *arg) {
   struct esp_uart_stats *s = &us->stats;
   struct esp_uart_stats *ps = &us->prev_stats;
   int uart_no = us->cfg->uart_no;
-  fprintf(stderr,
-          "UART%d ints %u; rx en %d bytes %u buf %u fifo %u, ovf %u, lcs %u; "
-          "tx %u %u %u, thr %u; hf %u i 0x%03x ie 0x%03x cts %d\n",
-          uart_no, s->ints - ps->ints, us->rx_enabled,
-          s->rx_bytes - ps->rx_bytes, us->rx_buf.used,
-          rx_fifo_len(us->cfg->uart_no), s->rx_overflows - ps->rx_overflows,
-          s->rx_linger_conts - ps->rx_linger_conts, s->tx_bytes - ps->tx_bytes,
-          us->tx_buf.used, tx_fifo_len(us->cfg->uart_no), s->tx_throttles,
-          system_get_free_heap_size(), READ_PERI_REG(UART_INT_RAW(uart_no)),
-          READ_PERI_REG(UART_INT_ENA(uart_no)), cts(uart_no));
+  fprintf(
+      stderr,
+      "UART%d ints %u/%u/%u; rx en %d bytes %u buf %u fifo %u, ovf %u, lcs %u; "
+      "tx %u %u %u, thr %u; hf %u i 0x%03x ie 0x%03x cts %d\n",
+      uart_no, s->ints - ps->ints, s->rx_ints - ps->rx_ints,
+      s->tx_ints - ps->tx_ints, us->rx_enabled, s->rx_bytes - ps->rx_bytes,
+      us->rx_buf.used, rx_fifo_len(us->cfg->uart_no),
+      s->rx_overflows - ps->rx_overflows,
+      s->rx_linger_conts - ps->rx_linger_conts, s->tx_bytes - ps->tx_bytes,
+      us->tx_buf.used, tx_fifo_len(us->cfg->uart_no),
+      s->tx_throttles - ps->tx_throttles, system_get_free_heap_size(),
+      READ_PERI_REG(UART_INT_RAW(uart_no)),
+      READ_PERI_REG(UART_INT_ENA(uart_no)), cts(uart_no));
   memcpy(ps, s, sizeof(*s));
 }
 
@@ -237,9 +244,7 @@ int esp_uart_validate_config(struct esp_uart_config *c) {
 }
 
 int esp_uart_init(struct esp_uart_config *cfg) {
-  static int int_attached = 0;
   if (cfg == NULL || !esp_uart_validate_config(cfg)) return 0;
-  WRITE_PERI_REG(UART_INT_ENA(cfg->uart_no), 0);
 
   struct esp_uart_state *us = s_us[cfg->uart_no];
   if (us != NULL) {
@@ -252,12 +257,13 @@ int esp_uart_init(struct esp_uart_config *cfg) {
   cs_rbuf_init(&us->rx_buf, cfg->rx_buf_size);
   cs_rbuf_init(&us->tx_buf, cfg->tx_buf_size);
 
+  ETS_INTR_DISABLE(ETS_UART_INUM);
   uart_div_modify(cfg->uart_no, UART_CLK_FREQ / cfg->baud_rate);
 
   if (cfg->uart_no == 0) {
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_U0TXD_U);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_U0TXD_U, FUNC_U0TXD);
-    if (cfg->swap_rxtx_ctsrts) {
+    if (cfg->swap_rxcts_txrts) {
       SET_PERI_REG_MASK(PERIPHS_DPORT_BASEADDR + HOST_INF_SEL,
                         PERI_IO_UART0_PIN_SWAP);
     } else {
@@ -267,7 +273,7 @@ int esp_uart_init(struct esp_uart_config *cfg) {
   } else {
     PIN_PULLUP_DIS(PERIPHS_IO_MUX_GPIO2_U);
     PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_U1TXD_BK);
-    if (cfg->swap_rxtx_ctsrts) {
+    if (cfg->swap_rxcts_txrts) {
       SET_PERI_REG_MASK(PERIPHS_DPORT_BASEADDR + HOST_INF_SEL,
                         PERI_IO_UART1_PIN_SWAP);
     } else {
@@ -301,20 +307,13 @@ int esp_uart_init(struct esp_uart_config *cfg) {
     os_timer_arm(&us->status_timer, cfg->status_interval_ms, 1 /* repeat */);
   }
 
+  s_us[cfg->uart_no] = us;
+
   /* Start with TX and RX ints disabled. */
   WRITE_PERI_REG(UART_INT_ENA(cfg->uart_no), UART_INFO_INTS);
 
-  s_us[cfg->uart_no] = us;
-  if (!int_attached) {
-#ifdef RTOS_SDK
-    _xt_isr_attach(ETS_UART_INUM, (void *) esp_uart_isr, NULL);
-    _xt_isr_unmask(1 << ETS_UART_INUM);
-#else
-    ETS_UART_INTR_ATTACH(esp_uart_isr, NULL);
-    ETS_INTR_ENABLE(ETS_UART_INUM);
-#endif
-    int_attached = 1;
-  }
+  ETS_UART_INTR_ATTACH(esp_uart_isr, NULL);
+  ETS_INTR_ENABLE(ETS_UART_INUM);
   return 1;
 }
 

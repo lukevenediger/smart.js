@@ -15,7 +15,7 @@ overflow-y: scroll;
 }
 * { outline: none; }
 h1 { font-size: 140%; }
-fieldset { border: 1px solid #3795d0; margin-bottom: 2em; }
+fieldset { border: 1px solid #3795d0; margin-top: 1em; }
 legend { zfont-size: 120%; color: #3795d0; }
 .row {
 position: relative;
@@ -91,168 +91,82 @@ border-radius: 0.4em;
 width: 21em;
 }
 </style>
+<script type="text/javascript" src="conflib.js"></script>
 <script type="text/javascript">
+  var SCHEMA = [];
   var DEFAULTS = {};  // System defaults config
-  var CONFIG = {};  // Configuration object. Gets set up on window load
-
-  var merge = function(_a, _b) {
-    var a = JSON.parse(JSON.stringify(_a));  // make a copy
-    var b = JSON.parse(JSON.stringify(_b));  // make a copy
-    for (k in b) {
-      if (typeof(a[k]) === 'object' && typeof(b[k]) == 'object') {
-        a[k] = merge(a[k], b[k]);
-      } else {
-        a[k] = b[k];
-      }
-    }
-    return a;
-  };
-
-  var ajax = function(url, callback, post_data) {
-    var httpRequest = window.XMLHttpRequest ?
-      new XMLHttpRequest() :
-      new ActiveXObject("Microsoft.XMLHTTP");
-
-    httpRequest.onreadystatechange = function() {
-      if (httpRequest.readyState == 4) {
-        document.getElementById('loading').style.display = 'none';
-        try {
-          if (httpRequest.status != 200) throw(httpRequest.statusText);
-          var t = httpRequest.responseText;
-          var obj = t ? JSON.parse(t) : '';
-          callback(obj);
-        } catch(e) {
-          //alert('Error fetching ' + httpRequest.responseURL + ': ' + e);
-          callback(undefined, e);
-        }
-      }
-    };
-    httpRequest.open(post_data !== undefined ? 'PUT' : 'GET', url, true);
-    httpRequest.send(post_data);
-    document.getElementById('loading').style.display = 'block';
-  };
-
-  var getElementValue = function(el) {
-    if (!el) return '';
-    if (el.type == 'checkbox') return el.checked ? true : false;
-    return el.value;
-  };
-
-  var setElementValue = function(el, val) {
-    if (el.type == 'checkbox') el.checked = !!val;
-    el.value = val;
-  };
-
-  var showMsg = function(result, error) {
-    alert(error ? 'Error: ' + error :
-          'Success. Module is rebooting, please reload this page.\n' +
-          'Note: if you changed WiFi settings you may need to navigate ' +
-          'your browser to new device address.');
-  };
+  var CURRENT = {};  // Configuration object. Gets set up on window load
 
   window.onload = function() {
-    document.getElementById('btn_reboot').onclick = function() {
-      ajax('/reboot', showMsg);
-    };
-
     document.getElementById('btn_save').onclick = function() {
-      var c = merge({}, DEFAULTS);
-      delete c.ro_vars;
-      var walk = function(c1, c2, p) {
-        var n = 0;
-        for (var k in c1) {
-          var path = p ? p + '.' + k : k;
-          if (typeof(c1[k]) == 'object') {
-            var j = walk(c1[k], c2[k], path);
-            if (j == 0) { delete c1[k]; } else { n += j };
-          } else {
-            c1[k] = getElementValue(document.getElementById(path));
-            if (c1[k] == c2[k]) { delete c1[k]; } else { n++; };
-          }
-        }
-        return n;
-      };
-      walk(c, DEFAULTS, '');
-      var text = JSON.stringify(c, null, 2);
-      ajax('/conf.json', function() {
-        ajax('/reboot', showMsg);
-      }, text);
-    };
+      confSave(SCHEMA, DEFAULTS, CURRENT);
+    }
+    document.getElementById('btn_reboot').onclick = confReboot;
+    document.getElementById('btn_reset').onclick = confReset;
 
-    document.getElementById('btn_reset').onclick = function() {
-      ajax('/factory_reset', showMsg);
-    };
-
-    var in2 = document.getElementById('fw_select_input2');
-    in2.onfocus = in2.onclick = function() {
-      document.getElementById('fw_select_input').click();
-    };
-
-    var renderConfig = function(c, schema) {
+    var renderConfig = function(schema, cfg) {
       var html = [];
-      var walk = function(c, p) {
-        for (var k in c) {
-          var path = p ? p + '.' + k : k;
-          var d = schema[path] || {}; // UI descriptor for that config param
-          var parent_d = schema[p] || {};
-          var val = c[k];
-          if (typeof(val) == 'object') {
-            if (!d.hide) {
-              //html.push('<h1>', d.title || path, '</h1>\n');
-              html.push('</fieldset><fieldset><legend>', d.title || path, '</legend>\n');
-            }
-            walk(val, path);
-          } else {
-            html.push('<div class="param">',
-                      '<label for="', path, '">', d.title || k, '</label>');
-
-            // Look if the element should be disabled.
-            var extra_attrs = '';
-            if (d.read_only || parent_d.read_only) {
-              extra_attrs = ' disabled ';
-            }
-
-            if (typeof(val) == 'boolean') {
-              html.push('<input type="checkbox" id="', path,
-                        '" ', extra_attrs, val ? ' checked' : '', '/>');
-            } else if (d.type == 'select') {
-              html.push('<select ', extra_attrs, 'id="', path, '">');
-              for (var i = 0; d.values && i < d.values.length; i++) {
-                var o = d.values[i];
-                html.push('<option value="', o.value, '" ', extra_attrs,
-                          o.value == val ? 'selected' : '', '>',
-                          o.title, '</option>');
-              }
-              html.push('</select>');
-            } else {
-              html.push('<input ', extra_attrs, 'type="text" id="', path,
-                        '" value="', val, '"/>');
-            }
-            html.push('</div>\n');
+      var currentObject = null;
+      for (var i in schema) {
+        var entry = schema[i];
+        var ep = entry[0], et = entry[1], ed = entry[2];
+        var val = confGet(cfg, ep);
+        var k = ep.split('.').pop();
+        if (typeof(val) !== 'object') console.debug(ep, et, typeof(val), val);
+        if (et === 'o' && typeof(val) === 'object') {
+          if (currentObject) html.push('</fieldset>')
+          currentObject = ep;
+          if (!ed.hide) {
+            html.push('<fieldset><legend>', ed.title || ep, '</legend>\n');
           }
+        } else if (!ed.hide) {
+          html.push('<div class="param">',
+                    '<label for="', ep, '">', ed.title || k, '</label>');
+
+          // Look if the element should be disabled.
+          var extra_attrs = '';
+          if (ed.read_only || !sj_conf_check_access(ep, CURRENT['conf_acl'])) {
+            extra_attrs = ' disabled ';
+          }
+
+          if (et == 'b') {
+            html.push('<input type="checkbox" id="', ep,
+                      '" ', extra_attrs, val ? ' checked' : '', '/>');
+          } else if (ed.type == 'select') {
+            html.push('<select ', extra_attrs, 'id="', ep, '">');
+            for (var i = 0; ed.values && i < ed.values.length; i++) {
+              var o = ed.values[i];
+              html.push('<option value="', o.value, '" ', extra_attrs,
+                        o.value == val ? 'selected' : '', '>',
+                        o.title, '</option>');
+            }
+            html.push('</select>');
+          } else {
+            html.push('<input ', extra_attrs, 'type="text" id="', ep,
+                      '" value="', val, '"/>');
+          }
+          html.push('</div>\n');
         }
-      };
-      walk(c, '');
+      }
       document.getElementById('config').innerHTML = html.join('');
     };
 
-    // Load configuration and update the UI
-    ajax('/conf_sys_defaults.json', function(obj, error) {
-      DEFAULTS = obj;
-      ajax('/conf_app_defaults.json', function(obj, error) {
-        DEFAULTS = merge(DEFAULTS, obj || {});
-        ajax('/conf.json', function(obj, error) {
-          CONFIG = merge(DEFAULTS, obj || {});
-          ajax('/ro_vars', function(obj, error) {
-            CONFIG = merge(CONFIG, { ro_vars: obj || {} });
-            ajax('/conf_sys_schema.json', function(obj, error) {
-              renderConfig(CONFIG, obj || {});
-            });
-          });
-        });
-      });
+    confLoad(function(schema, defaults, current) {
+      SCHEMA = schema;
+      DEFAULTS = defaults;
+      CURRENT = current;
+      document.getElementById('loading').style.display = 'none';
+      renderConfig(SCHEMA, merge(DEFAULTS, CURRENT));
     });
   };
+
+  function connectFileInputs(fnId, ffId) {
+    var fni = document.getElementById(fnId);
+    var ffi = document.getElementById(ffId);
+    fni.onclick = function() { ffi.click(); };
+    ffi.onchange = function() { fni.placeholder = ffi.value; };
+    if (ffi.value != "") fni.placeholder = ffi.value;
+  }
 </script>
 </head>
 <body>
@@ -276,18 +190,42 @@ width: 21em;
 
   <div class="row">
     <fieldset>
-      <legend>Upload new firmware</legend>
+      <legend>Upload a file</legend>
 
-<form id="fw_upload_form">
-  <input placeholder="Select .zip firmware archive ..."
-    id="fw_select_input2" type="text">
-  <input type="file" id="fw_select_input" accept=".zip" style="display: none">
-  <button class="button orange" id="fw_upload_button" type="submit">
-    Upload
-  </button>
-</form>
+      <form id="file_upload_form" method="POST" action="/upload"
+         enctype="multipart/form-data">
+        <input placeholder="Select a file to upload ..."
+          id="file_select_name" type="text">
+        <input type="file" id="file_select_file" name="file" style="display: none">
+        <button class="button orange" id="file_upload_button" type="submit">
+          Upload
+        </button>
+      </form>
 
     </fieldset>
+    <script type="text/javascript">
+      connectFileInputs('file_select_name', 'file_select_file');
+    </script>
+  </div>
+
+  <div class="row">
+    <fieldset>
+      <legend>Upload new firmware</legend>
+
+      <form id="fw_upload_form" method="POST" action="/update"
+         enctype="multipart/form-data">
+        <input placeholder="Select .zip firmware archive ..."
+          id="fw_select_name" type="text">
+        <input type="file" id="fw_select_file" name="file" accept=".zip" style="display: none">
+        <button class="button orange" id="fw_upload_button" type="submit">
+          Upload
+        </button>
+      </form>
+
+    </fieldset>
+    <script type="text/javascript">
+      connectFileInputs('fw_select_name', 'fw_select_file');
+    </script>
   </div>
 
 </body>

@@ -26,7 +26,7 @@ extern OsiMsgQ_t s_v7_q;
 
 void sj_invoke_cb(struct v7 *v7, v7_val_t func, v7_val_t this_obj,
                   v7_val_t args) {
-  struct prompt_event pe;
+  struct sj_event e;
   struct v7_invoke_event_data *ied = calloc(1, sizeof(*ied));
   ied->func = func;
   ied->this_obj = this_obj;
@@ -34,17 +34,21 @@ void sj_invoke_cb(struct v7 *v7, v7_val_t func, v7_val_t this_obj,
   v7_own(v7, &ied->func);
   v7_own(v7, &ied->this_obj);
   v7_own(v7, &ied->args);
-  pe.type = V7_INVOKE_EVENT;
-  pe.data = ied;
-  osi_MsgQWrite(&s_v7_q, &pe, OSI_WAIT_FOREVER);
+  e.type = V7_INVOKE_EVENT;
+  e.data = ied;
+  osi_MsgQWrite(&s_v7_q, &e, OSI_WAIT_FOREVER);
 }
 
 /* Defined in linker script. */
 extern unsigned long _heap;
 extern unsigned long _eheap;
 
+size_t sj_get_heap_size() {
+  return ((char *) &_eheap - (char *) &_heap);
+}
+
 size_t sj_get_free_heap_size() {
-  size_t avail = ((char *) &_eheap - (char *) &_heap);
+  size_t avail = sj_get_heap_size();
   struct mallinfo mi = mallinfo();
   avail -= mi.arena;    /* Claimed by allocator. */
   avail += mi.fordblks; /* Free in the area claimed by allocator. */
@@ -61,6 +65,18 @@ size_t sj_get_fs_memory_usage() {
 }
 
 void sj_wdt_feed() {
+  /* TODO */
+}
+
+void sj_wdt_set_timeout(int secs) {
+  /* TODO */
+}
+
+void sj_wdt_enable() {
+  /* TODO */
+}
+
+void sj_wdt_disable() {
   /* TODO */
 }
 

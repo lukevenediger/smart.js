@@ -87,6 +87,10 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
   (void) flags;
   (void) offset;
 
+  if (len == 0) {
+    return NULL;
+  }
+
   if (desc == NULL) {
     LOG(LL_ERROR, ("cannot allocate mmap desc"));
     return MAP_FAILED;
@@ -247,6 +251,7 @@ int fs_mount(spiffs *spf, uint32_t addr, uint32_t size, uint8_t *workbuf,
   cfg.hal_erase_f = esp_spiffs_erase;
 
   if (SPIFFS_mount(spf, &cfg, workbuf, fds, fds_size, 0, 0, 0) != SPIFFS_OK) {
+    LOG(LL_ERROR, ("SPIFFS_mount failed: %d", SPIFFS_errno(spf)));
     return SPIFFS_errno(spf);
   }
 
@@ -364,11 +369,21 @@ int _close_r(struct _reent *r, int fd) {
 }
 
 int _rename_r(struct _reent *r, const char *from, const char *to) {
-  int res =
-      SPIFFS_rename(&fs, get_fixed_filename(from), get_fixed_filename(to));
+  /*
+   * POSIX rename requires that in case "to" exists, it be atomically replaced
+   * with "from". The atomic part we can't do, but at least we can do replace.
+   */
+  int res;
+  {
+    spiffs_stat ss;
+    res = SPIFFS_stat(&fs, (char *) to, &ss);
+    if (res == 0) {
+      SPIFFS_remove(&fs, (char *) to);
+    }
+  }
+  res = SPIFFS_rename(&fs, get_fixed_filename(from), get_fixed_filename(to));
   (void) r;
   set_errno(res);
-
   return res;
 }
 
@@ -395,7 +410,7 @@ int _fstat_r(struct _reent *r, int fd, struct stat *s) {
   set_errno(res);
   if (res < 0) return res;
   s->st_ino = ss.obj_id;
-  s->st_mode = 0666;
+  s->st_mode = S_IFREG | 0666;
   s->st_nlink = 1;
   s->st_size = ss.size;
   return 0;
@@ -409,7 +424,8 @@ int _stat_r(struct _reent *r, const char *path, struct stat *s) {
    * spiffs has no directories, simulating statting root directory;
    * required for mg_send_http_file.
    */
-  if ((strcmp(path, "./") == 0) || (strcmp(path, "/") == 0)) {
+  if ((strcmp(path, ".") == 0) || (strcmp(path, "/") == 0) ||
+      (strcmp(path, "./") == 0)) {
     memset(s, 0, sizeof(*s));
     s->st_mode = S_IFDIR;
     return 0;
@@ -428,6 +444,10 @@ void fs_set_stdout_uart(int uart_no) {
 
 void fs_set_stderr_uart(int uart_no) {
   s_stderr_uart = uart_no;
+}
+
+void fs_flush_stderr() {
+  if (s_stderr_uart >= 0) esp_uart_flush(s_stderr_uart);
 }
 
 #ifndef NO_V7

@@ -3,8 +3,8 @@
  * All rights reserved
  */
 
-#ifndef SJ_V7_EXT_INCLUDED
-#define SJ_V7_EXT_INCLUDED
+#ifndef CS_SMARTJS_SRC_SJ_V7_EXT_H_
+#define CS_SMARTJS_SRC_SJ_V7_EXT_H_
 
 #include "v7/v7.h"
 
@@ -54,10 +54,19 @@ size_t sj_get_fs_memory_usage();
 /* Feed watchdog */
 void sj_wdt_feed();
 
+/* Set watchdog timeout*/
+void sj_wdt_set_timeout(int secs);
+
+/* Enable watchdog */
+void sj_wdt_enable();
+
+/* Disable watchdog */
+void sj_wdt_disable();
+
 /* Restart system */
 void sj_system_restart(int exit_code);
 
 /* Delay usecs */
 void sj_usleep(int usecs);
 
-#endif
+#endif /* CS_SMARTJS_SRC_SJ_V7_EXT_H_ */

@@ -1,5 +1,5 @@
-#ifndef _CS_PLATFORM_UNIX_H_
-#define _CS_PLATFORM_UNIX_H_
+#ifndef CS_COMMON_PLATFORMS_PLATFORM_UNIX_H_
+#define CS_COMMON_PLATFORMS_PLATFORM_UNIX_H_
 #if CS_PLATFORM == CS_P_UNIX
 
 #ifndef _XOPEN_SOURCE
@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -48,6 +49,15 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/*
+ * osx correctly avoids defining strtoll when compiling in strict ansi mode.
+ * We require strtoll, and if your embedded pre-c99 compiler lacks one, please
+ * implement a shim.
+ */
+#if !(defined(__DARWIN_C_LEVEL) && __DARWIN_C_LEVEL >= 200809L)
+long long strtoll(const char *, char **, int);
+#endif
 
 typedef int sock_t;
 #define INVALID_SOCKET (-1)
@@ -70,4 +80,4 @@ typedef struct stat cs_stat_t;
 #define closesocket(x) close(x)
 
 #endif /* CS_PLATFORM == CS_P_UNIX */
-#endif /* _CS_PLATFORM_UNIX_H_ */
+#endif /* CS_COMMON_PLATFORMS_PLATFORM_UNIX_H_ */

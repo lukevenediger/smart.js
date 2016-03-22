@@ -7,17 +7,7 @@
 #include <stdlib.h>
 #include <ets_sys.h>
 #include "v7/v7.h"
-#include "smartjs/src/sj_timers.h"
-#include "smartjs/src/sj_v7_ext.h"
-#include "smartjs/src/sj_i2c_js.h"
-#include "smartjs/src/sj_gpio_js.h"
-#include "smartjs/src/sj_adc_js.h"
-#include "v7_esp.h"
-#include "esp_pwm.h"
-#include "smartjs/src/sj_http.h"
-#include "smartjs/src/sj_mongoose_ws_client.h"
-#include "common/sha1.h"
-#include "esp_updater.h"
+#include "smartjs/platforms/esp8266/user/v7_esp.h"
 
 struct v7 *v7;
 
@@ -72,7 +62,7 @@ static enum v7_err crash(struct v7 *v7, v7_val_t *res) {
 }
 
 void init_v7(void *stack_base) {
-  struct v7_mk_opts opts;
+  struct v7_create_opts opts;
 
 #ifdef V7_THAW
   opts.object_arena_size = 85;

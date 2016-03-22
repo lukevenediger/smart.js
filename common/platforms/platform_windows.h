@@ -1,5 +1,5 @@
-#ifndef _CS_PLATFORM_WINDOWS_H_
-#define _CS_PLATFORM_WINDOWS_H_
+#ifndef CS_COMMON_PLATFORMS_PLATFORM_WINDOWS_H_
+#define CS_COMMON_PLATFORMS_PLATFORM_WINDOWS_H_
 #if CS_PLATFORM == CS_P_WINDOWS
 
 /*
@@ -20,20 +20,28 @@
 #endif
 
 #include <assert.h>
+#include <direct.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <io.h>
+#include <limits.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define random() rand()
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib") /* Linking with winsock library */
 #endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <process.h>
+
 #ifndef EINPROGRESS
 #define EINPROGRESS WSAEINPROGRESS
 #endif
@@ -52,6 +60,7 @@
 #define to64(x) _atoi64(x)
 #define popen(x, y) _popen((x), (y))
 #define pclose(x) _pclose(x)
+#define rmdir _rmdir
 #if defined(_MSC_VER) && _MSC_VER >= 1400
 #define fseeko(x, y, z) _fseeki64((x), (y), (z))
 #else
@@ -118,4 +127,4 @@ struct dirent *readdir(DIR *dir);
 #endif
 
 #endif /* CS_PLATFORM == CS_P_WINDOWS */
-#endif /* _CS_PLATFORM_WINDOWS_H_ */
+#endif /* CS_COMMON_PLATFORMS_PLATFORM_WINDOWS_H_ */

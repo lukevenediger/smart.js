@@ -8,14 +8,12 @@
 #include "common/platform.h"
 #include "common/str_util.h"
 
-#ifdef _MG_PROVIDE_STRNLEN
-size_t strnlen(const char *s, size_t maxlen) {
+size_t c_strnlen(const char *s, size_t maxlen) {
   size_t l = 0;
   for (; l < maxlen && s[l] != '\0'; l++) {
   }
   return l;
 }
-#endif
 
 #define C_SNPRINTF_APPEND_CHAR(ch)       \
   do {                                   \
@@ -144,7 +142,7 @@ int c_vsnprintf(char *buf, size_t buf_size, const char *fmt, va_list ap) {
       if (ch == 's') {
         const char *s = va_arg(ap, const char *); /* Always fetch parameter */
         int j;
-        int pad = field_width - (precision >= 0 ? strnlen(s, precision) : 0);
+        int pad = field_width - (precision >= 0 ? c_strnlen(s, precision) : 0);
         for (j = 0; j < pad; j++) {
           C_SNPRINTF_APPEND_CHAR(' ');
         }
@@ -246,5 +244,23 @@ int to_wchar(const char *path, wchar_t *wbuf, size_t wbuf_len) {
   return ret;
 }
 #endif /* _WIN32 */
+
+/* The simplest O(mn) algorithm. Better implementation are GPLed */
+const char *c_strnstr(const char *s, const char *find, size_t slen) {
+  size_t find_length = strlen(find);
+  size_t i;
+
+  for (i = 0; i < slen; i++) {
+    if (i + find_length > slen) {
+      return NULL;
+    }
+
+    if (strncmp(&s[i], find, find_length) == 0) {
+      return &s[i];
+    }
+  }
+
+  return NULL;
+}
 
 #endif /* EXCLUDE_COMMON */

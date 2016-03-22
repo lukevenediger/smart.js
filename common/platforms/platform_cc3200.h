@@ -3,8 +3,8 @@
  * All rights reserved
  */
 
-#ifndef _CS_PLATFORM_CC3200_H_
-#define _CS_PLATFORM_CC3200_H_
+#ifndef CS_COMMON_PLATFORMS_PLATFORM_CC3200_H_
+#define CS_COMMON_PLATFORMS_PLATFORM_CC3200_H_
 #if CS_PLATFORM == CS_P_CC3200
 
 #include <assert.h>
@@ -183,5 +183,21 @@ int gettimeofday(struct timeval *t, void *tz);
 
 long int random(void);
 
+#ifdef CC3200_ENABLE_SPIFFS
+#include <common/spiffs/spiffs.h>
+
+typedef struct {
+  spiffs_DIR dh;
+  struct spiffs_dirent de;
+} DIR;
+
+#define d_name name
+#define dirent spiffs_dirent
+
+DIR *opendir(const char *dir_name);
+int closedir(DIR *dir);
+struct dirent *readdir(DIR *dir);
+#endif
+
 #endif /* CS_PLATFORM == CS_P_CC3200 */
-#endif /* _CS_PLATFORM_CC3200_H_ */
+#endif /* CS_COMMON_PLATFORMS_PLATFORM_CC3200_H_ */

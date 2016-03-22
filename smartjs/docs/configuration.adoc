@@ -51,7 +51,7 @@ imp_*::
 
 Files that are meant to be edited by developers:
 
-app_init.js::
+app.js::
   Application-specific file. This file is called by `sys_init.js`.
   User code must go here.
 conf_app_defaults.json::
@@ -93,11 +93,12 @@ reinitialize all Smart.js modules.
 
 ==== Configuration parameters
 
-`wifi.sta.enable`:: Enable or disable station mode
+`wifi.sta.enable`:: Enable or disable station. Enabling station disables AP unless `wifi.ap.keep_enabled` is set
 `wifi.sta.ssid`:: SSID of WiFi network to connect
 `wifi.sta.pass`:: Password of WiFi network to connect
 
-`wifi.ap.mode`:: Access point mode. `0` - disabled, `1` - access point mode only, `2` - access point and station mode
+`wifi.ap.enable`:: Enable or disable AP
+`wifi.ap.keep_enabled`:: Keep AP enabled when station is on (if supported by the platform, e.g. ESP8266). Normally AP is turned off once station is configured
 `wifi.ap.trigger_on_gpio`:: GPIO number, which should be grounded to force AP mode
 `wifi.ap.ssid`:: SSID of created network
 `wifi.ap.pass`:: Password for created network
@@ -110,7 +111,7 @@ reinitialize all Smart.js modules.
 `wifi.ap.dhcp_end`:: Clients IP range end
 
 `http.enable`:: Enable or disable configuration web-server
-`http.port`:: Port to use for configuration web-server
+`http.listen_addr`:: Listen address for configuration web-server
 `http.enable_webdav`:: Enable access to the device via WebDAV
 
 `update.server_timeout`:: Timeout to use in network operations during update operation (seconds). Might be increased
@@ -132,3 +133,4 @@ if free memory amount is less than `memory_limit` value (bytes)
 `debug.stdout_uart`:: Where to send normal (stdout) output. `0` - UART0, `1` - UART`, `-1` - /dev/null. Default: `0`.
 `debug.stderr_uart`:: Where to send diagnostic (stderr) output. `0` - UART0, `1` - UART`, `-1` - /dev/null. Default: `1`.
 `debug.enable_prompt`:: Whether to enable interactive JavaScript prompt. Default: `true`.
+`debug.factory_reset_gpio`:: GPIO number that will trigger a factory reset if held low during boot. Default: `-1`.

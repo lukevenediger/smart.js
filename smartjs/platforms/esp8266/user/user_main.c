@@ -19,6 +19,7 @@
 #include "smartjs/platforms/esp8266/user/esp_exc.h"
 
 #include "smartjs/src/device_config.h"
+#include "smartjs/src/sj_app.h"
 #include "smartjs/src/sj_common.h"
 #include "smartjs/src/sj_mongoose.h"
 #include "smartjs/src/sj_prompt.h"
@@ -37,6 +38,9 @@ os_timer_t startcmd_timer;
 #ifndef ESP_DEBUG_UART
 #define ESP_DEBUG_UART 1
 #endif
+#ifndef ESP_DEBUG_UART_BAUD_RATE
+#define ESP_DEBUG_UART_BAUD_RATE 115200
+#endif
 
 #ifdef ESP_ENABLE_HEAP_LOG
 /*
@@ -45,6 +49,10 @@ os_timer_t startcmd_timer;
  */
 int uart_initialized = 0;
 #endif
+
+void dbg_putc(char c) {
+  fputc(c, stderr);
+}
 
 /*
  * SmartJS initialization, called as an SDK timer callback (`os_timer_...()`).
@@ -56,14 +64,25 @@ void sjs_init(void *dummy) {
    * level=LL_ERROR, then configuration is loaded this settings are overridden
    */
   {
-    esp_uart_init(esp_sj_uart_default_config(0));
+    struct esp_uart_config *u0cfg = esp_sj_uart_default_config(0);
+#if ESP_DEBUG_UART == 0
+    u0cfg->baud_rate = ESP_DEBUG_UART_BAUD_RATE;
+#endif
+    esp_uart_init(u0cfg);
     struct esp_uart_config *u1cfg = esp_sj_uart_default_config(1);
     /* UART1 has no RX pin, no point in allocating a buffer. */
     u1cfg->rx_buf_size = 0;
+#if ESP_DEBUG_UART == 1
+    u1cfg->baud_rate = ESP_DEBUG_UART_BAUD_RATE;
+#endif
     esp_uart_init(u1cfg);
     fs_set_stdout_uart(0);
     fs_set_stderr_uart(ESP_DEBUG_UART);
-    cs_log_set_level(LL_ERROR);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    cs_log_set_level(LL_DEBUG);
+    os_install_putc1(dbg_putc);
+    system_set_os_print(1);
 #ifdef ESP_ENABLE_HEAP_LOG
     uart_initialized = 1;
 #endif
@@ -92,16 +111,27 @@ void sjs_init(void *dummy) {
   mongoose_init();
 
   /* NOTE(lsm): must be done after mongoose_init(). */
-  init_device(v7);
+  if (!init_device(v7)) {
+    LOG(LL_ERROR, ("init_device failed"));
+    abort();
+  }
+
+  esp_print_reset_info();
 
 #ifndef DISABLE_OTA
   init_updater(v7);
 #endif
+  LOG(LL_INFO, ("Sys init done, SDK %s", system_get_sdk_version()));
+
+  if (!sj_app_init(v7)) {
+    LOG(LL_ERROR, ("App init failed"));
+    abort();
+  }
+  LOG(LL_INFO, ("App init done"));
 
   /* SJS initialized, enable GC back, and trigger it */
   v7_set_gc_enabled(v7, 1);
   v7_gc(v7, 1);
-  LOG(LL_INFO, ("init done"));
 
 #ifndef V7_NO_FS
   run_init_script();
@@ -129,6 +159,8 @@ void sjs_init(void *dummy) {
    */
   esp_umm_init();
 #endif
+
+  sj_wdt_set_timeout(get_cfg()->sys.wdt_timeout);
 }
 
 /*
@@ -140,12 +172,12 @@ void sdk_init_done_cb() {
 #if !defined(ESP_ENABLE_HW_WATCHDOG)
   ets_wdt_disable();
 #endif
-  pp_soft_wdt_stop();
+  system_soft_wdt_stop(); /* give 60 sec for initialization */
 
   /* Schedule SJS initialization (`sjs_init()`) */
   os_timer_disarm(&startcmd_timer);
   os_timer_setfn(&startcmd_timer, sjs_init, NULL);
-  os_timer_arm(&startcmd_timer, 100, 0);
+  os_timer_arm(&startcmd_timer, 0, 0);
 }
 
 /* Init function */
@@ -154,11 +186,6 @@ void user_init() {
   system_init_done_cb(sdk_init_done_cb);
 
   uart_div_modify(ESP_DEBUG_UART, UART_CLK_FREQ / 115200);
-
-  system_set_os_print(0);
-
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
 
   esp_exception_handler_init();
 

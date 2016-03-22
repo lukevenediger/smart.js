@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include "esp_exc.h"
+#include "esp_fs.h"
 #include "xtensa/corebits.h"
 #include "esp_hw.h"
 #include "common/platforms/esp8266/esp_missing_includes.h"
@@ -24,8 +25,7 @@
  * target register, patches up the program counter to point to the next
  * instruction and resumes execution.
  */
-IRAM NOINSTR void flash_emul_exception_handler(
-    struct xtensa_stack_frame *frame) {
+IRAM NOINSTR void flash_emul_exception_handler(UserFrame *frame) {
   uint32_t vaddr = RSR(EXCVADDR);
 
   /*
@@ -63,8 +63,11 @@ IRAM NOINSTR void flash_emul_exception_handler(
   uint8_t at = (instr >> 4) & 0xf;
   uint32_t val = 0;
 
-  //  printf("READING INSTRUCTION FROM %p\n", (void *) frame->pc);
-  //  printf("AT register %d\n", at);
+  /* Address is obviously invalid, punt. */
+  if ((void *) vaddr < MMAP_BASE) {
+    esp_exception_handler(frame);
+    return;
+  }
 
   if ((instr & 0xf00f) == 0x2) {
     /* l8ui at, as, imm       r = 0 */
@@ -94,16 +97,18 @@ IRAM NOINSTR void flash_emul_exception_handler(
       frame->pc -= 1; /* this instruction is only 2 bytes wide */
     }
   } else {
-    printf("cannot emulate flash mem instr at pc = %p\n", (void *) frame->pc);
+    fprintf(stderr, "cannot emulate flash mem instr at pc = %p\n",
+            (void *) frame->pc);
     esp_exception_handler(frame);
     return;
   }
 
-  /* a0 and a1 are never used as scratch registers */
-  frame->a[at - 2] = val;
+  /*
+   * a0 and a1 are never used as scratch registers.
+   * Here we assume that a2...15 are laid out contiguously in the struct.
+   */
+  *(&frame->a2 + at - 2) = val;
   frame->pc += 3;
-
-  // printf("PC FIXED UP RETURNING to %p\n", (void *) frame->pc);
 }
 
 NOINSTR void flash_emul_init() {

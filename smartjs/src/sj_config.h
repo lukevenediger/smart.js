@@ -3,8 +3,8 @@
  * All rights reserved
  */
 
-#ifndef SJ_CONFIG_H
-#define SJ_CONFIG_H
+#ifndef CS_SMARTJS_SRC_SJ_CONFIG_H_
+#define CS_SMARTJS_SRC_SJ_CONFIG_H_
 
 #include "mongoose/mongoose.h"
 
@@ -24,8 +24,16 @@
  * See ../test/unit_test.c for an example.
  */
 
-int sj_conf_get_str(struct json_token *toks, const char *key, char **val);
-int sj_conf_get_int(struct json_token *toks, const char *key, int *val);
-int sj_conf_get_bool(struct json_token *toks, const char *key, int *val);
+int sj_conf_get_str(struct json_token *toks, const char *key, const char *acl,
+                    char **val);
+int sj_conf_get_int(struct json_token *toks, const char *key, const char *acl,
+                    int *val);
+int sj_conf_get_bool(struct json_token *toks, const char *key, const char *acl,
+                     int *val);
+void sj_conf_emit_str(struct mbuf *b, const char *prefix, const char *s,
+                      const char *suffix);
+void sj_conf_emit_int(struct mbuf *b, int v);
 
-#endif
+int sj_conf_check_access(const char *key, const char *acl);
+
+#endif /* CS_SMARTJS_SRC_SJ_CONFIG_H_ */

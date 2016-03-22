@@ -8,7 +8,8 @@ import os
 import sys
 import zipfile
 
-# Debian/Ubuntu: python-git
+# Debian/Ubuntu: apt-get install python-git
+# PIP: pip install GitPython
 import git
 
 FW_MANIFEST_FILE_NAME = 'manifest.json'
@@ -34,6 +35,26 @@ def get_tag_for_commit(repo, commit):
         if tag.commit == commit:
             return tag.name
     return None
+
+def _write_build_info(bi, args):
+    if args.json_output:
+        if args.json_output == '-':
+            out = sys.stdout
+        else:
+            out = open(args.json_output, 'w')
+        json.dump(bi, out, indent=2, sort_keys=True)
+
+    if args.c_output:
+        if args.c_output == '-':
+            out = sys.stdout
+        else:
+            out = open(args.c_output, 'w')
+        print >>out, """\
+/* Auto-generated, do not edit. */
+const char *build_id = "%(build_id)s";
+const char *build_timestamp = "%(build_timestamp)s";
+const char *build_version = "%(build_version)s";\
+""" % bi
 
 
 def cmd_gen_build_info(args):
@@ -70,35 +91,33 @@ def cmd_gen_build_info(args):
                 branch_or_tag = '?'
         else:
             branch_or_tag = repo.active_branch
+
+        if args.dirty == "auto":
+            dirty = repo.is_dirty()
+        else:
+            dirty = args.dirty == "true"
         id = '%s/%s@%s%s' % (
             ts.strftime('%Y%m%d-%H%M%S'),
             branch_or_tag,
             str(repo.head.commit)[:8],
-            '+' if repo.is_dirty() else '')
+            '+' if dirty else '')
     elif args.id != '':
         id = args.id
     if id is not None:
         bi['build_id'] = id
 
-    if args.json_output:
-        if args.json_output == '-':
-            out = sys.stdout
-        else:
-            out = open(args.json_output, 'w')
-        json.dump(bi, out, indent=2, sort_keys=True)
+    _write_build_info(bi, args)
 
-    if args.c_output:
-        if args.c_output == '-':
-            out = sys.stdout
-        else:
-            out = open(args.c_output, 'w')
-        print >>out, """\
-/* Auto-generated, do not edit. */
-const char *build_id = "%(build_id)s";
-const char *build_timestamp = "%(build_timestamp)s";
-const char *build_version = "%(build_version)s";\
-""" % bi
 
+def cmd_get_build_info(args):
+    manifest = json.load(open(args.manifest))
+    bi = dict(
+        build_timestamp=manifest.get("build_timestamp"),
+        build_version=manifest.get("version"),
+        build_id=manifest.get("build_id"),
+    )
+
+    _write_build_info(bi, args)
 
 def cmd_create_manifest(args):
     manifest = {
@@ -146,7 +165,9 @@ def cmd_create_manifest(args):
 def cmd_create_fw(args):
     manifest = json.load(open(args.manifest))
     arc_dir = '%s-%s' % (manifest['name'], manifest['version'])
-    with zipfile.ZipFile(args.output, 'w', zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(args.output, 'w', zipfile.ZIP_STORED) as zf:
+        manifest_arc_name = os.path.join(arc_dir, FW_MANIFEST_FILE_NAME)
+        zf.writestr(manifest_arc_name, json.dumps(manifest, indent=2, sort_keys=True))
         for _, part in manifest['parts'].items():
             if 'src' not in part:
                 continue
@@ -157,8 +178,6 @@ def cmd_create_fw(args):
             arc_file = os.path.join(arc_dir, os.path.basename(src_file))
             zf.write(src_file, arc_file)
             part['src'] = os.path.basename(arc_file)
-        manifest_arc_name = os.path.join(arc_dir, FW_MANIFEST_FILE_NAME)
-        zf.writestr(manifest_arc_name, json.dumps(manifest, indent=2, sort_keys=True))
 
 
 def cmd_get(args):
@@ -176,16 +195,26 @@ if __name__ == '__main__':
     handlers = {}
     parser = argparse.ArgumentParser(description='FW metadata tool', prog='fw_manifest')
     cmd = parser.add_subparsers(dest='cmd')
-    gbi_cmd = cmd.add_parser('gen_build_info')
+    gbi_desc = "Generate build info"
+    gbi_cmd = cmd.add_parser('gen_build_info', help=gbi_desc, description=gbi_desc)
     gbi_cmd.add_argument('--timestamp', '-t')
     gbi_cmd.add_argument('--version', '-v')
     gbi_cmd.add_argument('--id', '-i')
+    gbi_cmd.add_argument('--dirty', default="auto", choices=["auto", "true", "false"])
     gbi_cmd.add_argument('--tag_as_version', type=bool, default=False)
     gbi_cmd.add_argument('--json_output')
     gbi_cmd.add_argument('--c_output')
     handlers['gen_build_info'] = cmd_gen_build_info
 
-    cm_cmd = cmd.add_parser('create_manifest')
+    gtbi_desc = "Extract build info from manifest"
+    gtbi_cmd = cmd.add_parser('get_build_info', help=gtbi_desc, description=gtbi_desc)
+    gtbi_cmd.add_argument('--manifest', '-m', required=True)
+    gtbi_cmd.add_argument('--json_output')
+    gtbi_cmd.add_argument('--c_output')
+    handlers['get_build_info'] = cmd_get_build_info
+
+    cm_desc = "Create manifest"
+    cm_cmd = cmd.add_parser('create_manifest', help=cm_desc, description=cm_desc)
     cm_cmd.add_argument('--name', '-n', required=True)
     cm_cmd.add_argument('--platform', '-p', required=True)
     cm_cmd.add_argument('--build_info', '-i', required=True)
@@ -196,13 +225,15 @@ if __name__ == '__main__':
     cm_cmd.add_argument('parts', nargs='+')
     handlers['create_manifest'] = cmd_create_manifest
 
-    cf_cmd = cmd.add_parser('create_fw')
+    cf_desc = "Create firmware ZIP"
+    cf_cmd = cmd.add_parser('create_fw', help=cf_desc, description=cf_desc)
     cf_cmd.add_argument('--manifest', '-m', required=True)
     cf_cmd.add_argument('--output', '-o', required=True)
     cf_cmd.add_argument('--src_dir')
     handlers['create_fw'] = cmd_create_fw
 
-    get_cmd = cmd.add_parser('get')
+    get_desc = "Extract keys from a JSON file"
+    get_cmd = cmd.add_parser('get', help=get_desc, description=get_desc)
     get_cmd.add_argument('json_file')
     get_cmd.add_argument('keys', nargs='+')
     handlers['get'] = cmd_get

@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -14,6 +15,8 @@
 #include "rom.h"
 #include "rom_map.h"
 #include "uart.h"
+
+#include <common/platform.h>
 
 #include "config.h"
 #include "cc3200_fs.h"
@@ -64,6 +67,17 @@ int _open(const char *pathname, int flags, mode_t mode) {
   }
   dprintf(("open(%s, 0x%x) = %d\n", pathname, flags, fd));
   return fd;
+}
+
+int _stat(const char *pathname, struct stat *st) {
+  int res;
+  if (is_ti_fname(pathname)) {
+    res = fs_failfs_stat(ti_fname(pathname), st);
+  } else {
+    res = fs_spiffs_stat(pathname, st);
+  }
+  dprintf(("stat(%s) = %d\n", pathname, res));
+  return res;
 }
 
 int _close(int fd) {
@@ -212,4 +226,39 @@ int _unlink(const char *filename) {
   }
   dprintf(("unlink(%s) = %d\n", filename, r));
   return r;
+}
+
+DIR *opendir(const char *dir_name) {
+  DIR *r = NULL;
+  if (is_ti_fname(dir_name)) {
+    r = NULL;
+    set_errno(ENOTSUP);
+  } else {
+    r = fs_spiffs_opendir(dir_name);
+  }
+  dprintf(("opendir(%s) = %p\n", dir_name, r));
+  return r;
+}
+
+struct dirent *readdir(DIR *dir) {
+  struct dirent *res = fs_spiffs_readdir(dir);
+  dprintf(("readdir(%p) = %p\n", dir, res));
+  return res;
+}
+
+int closedir(DIR *dir) {
+  int res = fs_spiffs_closedir(dir);
+  dprintf(("closedir(%p) = %d\n", dir, res));
+  return res;
+}
+
+int rmdir(const char *path) {
+  return fs_spiffs_rmdir(path);
+}
+
+int mkdir(const char *path, mode_t mode) {
+  (void) path;
+  (void) mode;
+  /* for spiffs supports only root dir, which comes from mongoose as '.' */
+  return (strlen(path) == 1 && *path == '.') ? 0 : ENOTDIR;
 }

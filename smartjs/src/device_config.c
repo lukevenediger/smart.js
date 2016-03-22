@@ -11,8 +11,8 @@
 #include "common/cs_file.h"
 #include "smartjs/src/sj_mongoose.h"
 #include "smartjs/src/device_config.h"
-
-#define SYSTEM_DEFAULT_JSON_FILE "conf_sys_defaults.json"
+#include "smartjs/src/sj_config.h"
+#include "smartjs/src/sj_gpio.h"
 
 #define MG_F_RELOAD_CONFIG MG_F_USER_5
 #define PLACEHOLDER_CHAR '?'
@@ -46,6 +46,9 @@ static char s_mac_address[13];
 static const char *mac_address_ptr = s_mac_address;
 static struct mg_connection *listen_conn;
 
+static int load_config_file(const char *filename, const char *acl, int required,
+                            struct sys_config *cfg);
+
 static void export_read_only_vars_to_v7(struct v7 *v7) {
   struct ro_var *rv;
   if (v7 == NULL) return;
@@ -72,19 +75,102 @@ void expand_mac_address_placeholders(char *str) {
   }
 }
 
+static int load_config_defaults(struct sys_config *cfg) {
+  /* TODO(rojer): Figure out what to do about merging two different defaults. */
+  if (!load_config_file(CONF_SYS_DEFAULTS_FILE, "*", 0, cfg)) return 0;
+  if (!load_config_file(CONF_APP_DEFAULTS_FILE, cfg->conf_acl, 0, cfg))
+    return 0;
+  /* Vendor config is optional. */
+  load_config_file(CONF_VENDOR_FILE, cfg->conf_acl, 0, cfg);
+  return 1;
+}
+
 #define JSON_HEADERS "Connection: close\r\nContent-Type: application/json"
 
+static int save_json(const struct mg_str *data, const char *file_name) {
+  FILE *fp;
+  int len = parse_json(data->p, data->len, NULL, 0);
+  if (len <= 0) {
+    LOG(LL_ERROR, ("%s\n", "Invalid JSON string"));
+    return 0;
+  }
+  fp = fopen("tmp", "w");
+  if (fp == NULL) {
+    LOG(LL_ERROR, ("Error opening file for writing\n"));
+    return 0;
+  }
+  if (fwrite(data->p, 1, len, fp) != (size_t) len) {
+    LOG(LL_ERROR, ("Error writing file\n"));
+    fclose(fp);
+    return 0;
+  }
+  if (fclose(fp) != 0) {
+    LOG(LL_ERROR, ("Error closing file\n"));
+    return 0;
+  }
+  if (rename("tmp", file_name) != 0) {
+    LOG(LL_ERROR, ("Error renaming file to %s\n", file_name));
+    return 0;
+  }
+  return 1;
+}
+
+static void conf_handler(struct mg_connection *c, int ev, void *p) {
+  struct http_message *hm = (struct http_message *) p;
+  if (ev != MG_EV_HTTP_REQUEST) return;
+  LOG(LL_DEBUG, ("[%.*s] requested", (int) hm->uri.len, hm->uri.p));
+  char *json = NULL;
+  int status = -1;
+  int rc = 200;
+  if (mg_vcmp(&hm->uri, "/conf/defaults") == 0) {
+    struct sys_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (load_config_defaults(&cfg)) {
+      json = emit_sys_config(&cfg);
+    }
+  } else if (mg_vcmp(&hm->uri, "/conf/current") == 0) {
+    json = emit_sys_config(&s_cfg);
+  } else if (mg_vcmp(&hm->uri, "/conf/save") == 0) {
+    status = (save_json(&hm->body, CONF_FILE) != 1);
+    if (status == 0) c->flags |= MG_F_RELOAD_CONFIG;
+  } else if (mg_vcmp(&hm->uri, "/conf/reset") == 0) {
+    struct stat st;
+    if (stat(CONF_FILE, &st) == 0) {
+      status = remove(CONF_FILE);
+    } else {
+      status = 0;
+    }
+    if (status == 0) c->flags |= MG_F_RELOAD_CONFIG;
+  }
+
+  if (json == NULL) {
+    if (asprintf(&json, "{\"status\": %d}\n", status) < 0) {
+      json = "{\"status\": -1}";
+    } else {
+      rc = (status == 0 ? 200 : 500);
+    }
+  }
+
+  {
+    int len = strlen(json);
+    mg_send_head(c, rc, len, JSON_HEADERS);
+    mg_send(c, json, len);
+    free(json);
+  }
+  c->flags |= MG_F_SEND_AND_CLOSE;
+}
+
 static void reboot_handler(struct mg_connection *c, int ev, void *p) {
-  (void) ev;
   (void) p;
+  if (ev != MG_EV_HTTP_REQUEST) return;
   LOG(LL_DEBUG, ("Reboot requested"));
   mg_send_head(c, 200, 0, JSON_HEADERS);
   c->flags |= (MG_F_SEND_AND_CLOSE | MG_F_RELOAD_CONFIG);
 }
 
 static void ro_vars_handler(struct mg_connection *c, int ev, void *p) {
-  (void) ev;
   (void) p;
+  if (ev != MG_EV_HTTP_REQUEST) return;
   LOG(LL_DEBUG, ("RO-vars requested"));
   /* Reply with JSON object that contains read-only variables */
   mg_send_head(c, 200, -1, JSON_HEADERS);
@@ -99,45 +185,142 @@ static void ro_vars_handler(struct mg_connection *c, int ev, void *p) {
   c->flags |= MG_F_SEND_AND_CLOSE;
 }
 
-static void factory_reset_handler(struct mg_connection *c, int ev, void *p) {
-  (void) ev;
-  (void) p;
-  LOG(LL_DEBUG, ("Factory reset requested"));
-  remove("conf.json");
-  c->flags |= (MG_F_SEND_AND_CLOSE | MG_F_RELOAD_CONFIG);
-  mg_send_head(c, 200, 0, JSON_HEADERS);
-  c->flags |= MG_F_SEND_AND_CLOSE;
+static void upload_handler(struct mg_connection *c, int ev, void *p) {
+  switch (ev) {
+    case MG_EV_HTTP_MULTIPART_REQUEST: {
+      c->user_data = NULL;
+      break;
+    }
+    case MG_EV_HTTP_PART_BEGIN: {
+      struct mg_http_multipart_part *mp = (struct mg_http_multipart_part *) p;
+
+      if (!sj_conf_check_access(mp->file_name, get_cfg()->http.upload_acl)) {
+        LOG(LL_ERROR, ("%p Not allowed to upload %s", c, mp->file_name));
+        mg_printf(c,
+                  "HTTP/1.1 403 Not Allowed\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "Connection: close\r\n\r\n"
+                  "Not allowed to upload %s\r\n",
+                  mp->file_name);
+        c->flags |= MG_F_SEND_AND_CLOSE;
+        return;
+      }
+      LOG(LL_DEBUG, ("%p Begin receiving file: %s", c, mp->file_name));
+      FILE *fp = fopen(mp->file_name, "w");
+      if (fp == NULL) {
+        mg_printf(c,
+                  "HTTP/1.1 500 Internal Server Error\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "Connection: close\r\n\r\n");
+        LOG(LL_ERROR, ("Failed to open %s: %d\n", mp->file_name, errno));
+        mg_printf(c, "Failed to open %s: %d\r\n", mp->file_name, errno);
+        c->flags |= MG_F_SEND_AND_CLOSE;
+        return;
+      }
+      c->user_data = (void *) fp;
+      break;
+    }
+    case MG_EV_HTTP_PART_DATA: {
+      FILE *fp = (FILE *) c->user_data;
+      if (fp == NULL) break;
+      struct mg_http_multipart_part *mp = (struct mg_http_multipart_part *) p;
+      LOG(LL_DEBUG, ("%p rec'd %d bytes", c, (int) mp->data.len));
+      if (fwrite(mp->data.p, 1, mp->data.len, fp) != mp->data.len) {
+        LOG(LL_ERROR, ("Failed to write to %s: %d, wrote %d", mp->file_name,
+                       errno, (int) ftell(fp)));
+        if (errno == ENOSPC
+#ifdef SPIFFS_ERR_FULL
+            || errno == SPIFFS_ERR_FULL
+#endif
+            ) {
+          mg_printf(c,
+                    "HTTP/1.1 413 Payload Too Large\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n");
+          mg_printf(c, "Failed to write to %s: no space left; wrote %d\r\n",
+                    mp->file_name, (int) ftell(fp));
+        } else {
+          mg_printf(c,
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Connection: close\r\n\r\n");
+          mg_printf(c, "Failed to write to %s: %d, wrote %d", mp->file_name,
+                    errno, (int) ftell(fp));
+        }
+        fclose(fp);
+        remove(mp->file_name);
+        c->user_data = NULL;
+        c->flags |= MG_F_SEND_AND_CLOSE;
+        return;
+      }
+      break;
+    }
+    case MG_EV_HTTP_PART_END: {
+      FILE *fp = (FILE *) c->user_data;
+      if (fp == NULL) break;
+      struct mg_http_multipart_part *mp = (struct mg_http_multipart_part *) p;
+      if (mp->status >= 0) {
+        LOG(LL_INFO,
+            ("%p Stored %s, %d bytes", c, mp->file_name, (int) ftell(fp)));
+        mg_printf(c,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "Connection: close\r\n\r\n"
+                  "Ok, %s - %d bytes.\r\n",
+                  mp->file_name, (int) ftell(fp));
+      } else {
+        LOG(LL_ERROR, ("Failed to store %s", mp->file_name));
+        /*
+         * mp->status < 0 means connection was terminated, so no reason to send
+         * HTTP reply
+         */
+      }
+      fclose(fp);
+      c->user_data = NULL;
+      c->flags |= MG_F_SEND_AND_CLOSE;
+      break;
+    }
+  }
 }
 
 static void mongoose_ev_handler(struct mg_connection *c, int ev, void *p) {
   LOG(LL_VERBOSE_DEBUG,
-      ("%s: %p ev %d, fl %lx l %lu %lu", __func__, p, ev, c->flags,
+      ("%p ev %d p %p fl %lx l %lu %lu", c, ev, p, c->flags,
        (unsigned long) c->recv_mbuf.len, (unsigned long) c->send_mbuf.len));
 
   switch (ev) {
+    case MG_EV_ACCEPT: {
+      char addr[32];
+      mg_sock_addr_to_str(&c->sa, addr, sizeof(addr),
+                          MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+      LOG(LL_INFO, ("%p HTTP connection from %s", c, addr));
+      break;
+    }
     case MG_EV_HTTP_REQUEST: {
       struct http_message *hm = (struct http_message *) p;
-      LOG(LL_DEBUG,
-          ("[%.*s] -> [%.*s]\n", (int) ((hm->body.p - 1) - hm->message.p),
-           hm->message.p, (int) c->send_mbuf.len, c->send_mbuf.buf));
+      LOG(LL_INFO, ("%p %.*s %.*s", c, (int) hm->method.len, hm->method.p,
+                    (int) hm->uri.len, hm->uri.p));
 
       mg_serve_http(c, p, s_http_server_opts);
       c->flags |= MG_F_SEND_AND_CLOSE;
       break;
     }
-    case MG_EV_CLOSE:
+    case MG_EV_CLOSE: {
       /* If we've sent the reply to the server, and should reboot, reboot */
       if (c->flags & MG_F_RELOAD_CONFIG) {
         c->flags &= ~MG_F_RELOAD_CONFIG;
         device_reboot();
       }
       break;
+    }
   }
 }
 
 void device_register_http_endpoint(const char *uri,
                                    mg_event_handler_t handler) {
-  mg_register_http_endpoint(listen_conn, uri, handler);
+  if (listen_conn != NULL) {
+    mg_register_http_endpoint(listen_conn, uri, handler);
+  }
 }
 
 static int init_web_server(const struct sys_config *cfg) {
@@ -151,40 +334,75 @@ static int init_web_server(const struct sys_config *cfg) {
   if (cfg->http.enable_webdav) {
     s_http_server_opts.dav_document_root = ".";
   }
+  if (cfg->http.hidden_files) {
+    s_http_server_opts.hidden_file_pattern = strdup(cfg->http.hidden_files);
+  }
 
-  listen_conn = mg_bind(&sj_mgr, cfg->http.port, mongoose_ev_handler);
+  listen_conn = mg_bind(&sj_mgr, cfg->http.listen_addr, mongoose_ev_handler);
   if (!listen_conn) {
-    LOG(LL_ERROR, ("Error binding to port [%s]", cfg->http.port));
+    LOG(LL_ERROR, ("Error binding to [%s]", cfg->http.listen_addr));
     return 0;
   } else {
+    mg_register_http_endpoint(listen_conn, "/conf/", conf_handler);
     mg_register_http_endpoint(listen_conn, "/reboot", reboot_handler);
     mg_register_http_endpoint(listen_conn, "/ro_vars", ro_vars_handler);
-    mg_register_http_endpoint(listen_conn, "/factory_reset",
-                              factory_reset_handler);
+    mg_register_http_endpoint(listen_conn, "/upload", upload_handler);
 
     mg_set_protocol_http_websocket(listen_conn);
-    LOG(LL_INFO, ("HTTP server started on port [%s]", cfg->http.port));
+    LOG(LL_INFO, ("HTTP server started on [%s]", cfg->http.listen_addr));
   }
   return 1;
 }
 
-int init_device(struct v7 *v7) {
-  char *defaults = NULL, *overrides = NULL;
+static int load_config_file(const char *filename, const char *acl, int required,
+                            struct sys_config *cfg) {
+  char *data, *acl_copy;
   size_t size;
-  int result = 0;
+  int result = 1;
+  LOG(LL_DEBUG, ("=== Loading %s", filename));
+  data = cs_read_file(filename, &size);
+  /* Make a temporary copy, in case it gets overridden while loading. */
+  acl_copy = (acl != NULL ? strdup(acl) : NULL);
+  if (data == NULL || !parse_sys_config(data, acl_copy, required, cfg)) {
+    LOG(required ? LL_ERROR : LL_INFO, ("Failed to load %s", filename));
+    result = 0;
+  }
+  free(data);
+  free(acl_copy);
+  return result;
+}
+
+int init_device(struct v7 *v7) {
+  int result = 1;
   uint8_t mac[6] = "";
 
   /* Load system defaults - mandatory */
   memset(&s_cfg, 0, sizeof(s_cfg));
-  if ((defaults = cs_read_file(SYSTEM_DEFAULT_JSON_FILE, &size)) != NULL &&
-      parse_sys_config(defaults, &s_cfg, 1)) {
-    /* Successfully loaded system config. Try overrides - they are optional. */
-    overrides = cs_read_file(OVERRIDES_JSON_FILE, &size);
-    parse_sys_config(overrides, &s_cfg, 0);
-    result = 1;
+  if (!load_config_defaults(&s_cfg)) {
+    LOG(LL_ERROR, ("Failed to load config defaults"));
+    return 0;
   }
-  free(defaults);
-  free(overrides);
+
+#ifndef SJ_DISABLE_GPIO
+  /*
+   * Check factory reset GPIO. We intentionally do it before loading CONF_FILE
+   * so that it cannot be overridden by the end user.
+   */
+  if (s_cfg.debug.factory_reset_gpio >= 0) {
+    int gpio = s_cfg.debug.factory_reset_gpio;
+    sj_gpio_set_mode(gpio, GPIO_MODE_INPUT, GPIO_PULL_PULLUP);
+    if (sj_gpio_read(gpio) == GPIO_LEVEL_LOW) {
+      LOG(LL_WARN, ("Factory reset requested via GPIO%d", gpio));
+      if (remove(CONF_FILE) == 0) {
+        LOG(LL_WARN, ("Removed %s", CONF_FILE));
+      }
+      /* Continue as if nothing happened, no reboot necessary. */
+    }
+  }
+#endif
+
+  /* Successfully loaded system config. Try overrides - they are optional. */
+  load_config_file(CONF_FILE, s_cfg.conf_acl, 0, &s_cfg);
 
   REGISTER_RO_VAR(fw_id, &build_id);
   REGISTER_RO_VAR(fw_timestamp, &build_timestamp);
@@ -196,15 +414,19 @@ int init_device(struct v7 *v7) {
   snprintf(s_mac_address, sizeof(s_mac_address), "%02X%02X%02X%02X%02X%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   REGISTER_RO_VAR(mac_address, &mac_address_ptr);
-  LOG(LL_INFO, ("MAC: %s\n", s_mac_address));
+  LOG(LL_INFO, ("MAC: %s", s_mac_address));
 
   if (get_cfg()->wifi.ap.ssid != NULL) {
     expand_mac_address_placeholders((char *) get_cfg()->wifi.ap.ssid);
   }
 
-  if (result && (result = device_init_platform(v7, get_cfg())) != 0 &&
-      get_cfg()->http.enable) {
-    result = init_web_server(get_cfg());
+  result = device_init_platform(v7, get_cfg());
+  if (result != 0) {
+    if (get_cfg()->http.enable) {
+      result = init_web_server(get_cfg());
+    }
+  } else {
+    LOG(LL_ERROR, ("Platform init failed"));
   }
 
   /* NOTE(lsm): must be done last */

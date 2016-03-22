@@ -3,14 +3,15 @@
  * All rights reserved
  */
 
-#ifndef _CC3200_HAL_H_
-#define _CC3200_HAL_H_
+#ifndef CS_SMARTJS_PLATFORMS_CC3200_CC3200_SJ_HAL_H_
+#define CS_SMARTJS_PLATFORMS_CC3200_CC3200_SJ_HAL_H_
 
 #include "v7/v7.h"
 
 #define PROMPT_CHAR_EVENT 0
 #define V7_INVOKE_EVENT 1
-struct prompt_event {
+#define GPIO_INT_EVENT 2
+struct sj_event {
   int type;
   void *data;
 };
@@ -21,4 +22,6 @@ struct v7_invoke_event_data {
   v7_val_t args;
 };
 
-#endif /* _CC3200_HAL_H_ */
+size_t sj_get_heap_size();
+
+#endif /* CS_SMARTJS_PLATFORMS_CC3200_CC3200_SJ_HAL_H_ */

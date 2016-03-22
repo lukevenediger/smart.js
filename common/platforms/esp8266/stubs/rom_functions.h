@@ -1,5 +1,5 @@
-#ifndef _ROM_FUNCTIONS_H_
-#define _ROM_FUNCTIONS_H_
+#ifndef CS_COMMON_PLATFORMS_ESP8266_STUBS_ROM_FUNCTIONS_H_
+#define CS_COMMON_PLATFORMS_ESP8266_STUBS_ROM_FUNCTIONS_H_
 
 #include <inttypes.h>
 
@@ -21,6 +21,7 @@ uint32_t SPILock();
 uint32_t SPIUnlock();
 uint32_t SPIRead(uint32_t addr, void *dst, uint32_t size);
 uint32_t SPIWrite(uint32_t addr, const uint8_t *src, uint32_t size);
+uint32_t SPIEraseChip();
 uint32_t SPIEraseBlock(uint32_t block_num);
 uint32_t SPIEraseSector(uint32_t sector_num);
 uint32_t SPI_read_status();
@@ -70,4 +71,4 @@ void MD5Init(struct MD5Context *ctx);
 void MD5Update(struct MD5Context *ctx, void *buf, uint32_t len);
 void MD5Final(uint8_t digest[16], struct MD5Context *ctx);
 
-#endif /* _ROM_FUNCTIONS_H_ */
+#endif /* CS_COMMON_PLATFORMS_ESP8266_STUBS_ROM_FUNCTIONS_H_ */
