@@ -15909,6 +15909,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("random"),
     V7_VEC("readAll"),
     V7_VEC("readByte"),  /* sjs */
+    V7_VEC("readDistance"), /* sjs */
     V7_VEC("readString"),  /* sjs */
     V7_VEC("readVoltage"),  /* sjs */
     V7_VEC("readyState"),  /* sjs */
