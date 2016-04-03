@@ -26,21 +26,22 @@
 
 #include "oslib/osi.h"
 
-#include "sj_mongoose.h"
-#include "sj_http.h"
-#include "sj_gpio.h"
-#include "sj_gpio_js.h"
-#include "sj_i2c_js.h"
-#include "sj_prompt.h"
-#include "sj_timers.h"
-#include "sj_v7_ext.h"
-#include "sj_wifi_js.h"
-#include "sj_wifi.h"
+#include "smartjs/src/device_config.h"
+#include "smartjs/src/sj_mongoose.h"
+#include "smartjs/src/sj_http.h"
+#include "smartjs/src/sj_gpio.h"
+#include "smartjs/src/sj_gpio_js.h"
+#include "smartjs/src/sj_i2c_js.h"
+#include "smartjs/src/sj_prompt.h"
+#include "smartjs/src/sj_timers.h"
+#include "smartjs/src/sj_v7_ext.h"
+#include "smartjs/src/sj_wifi_js.h"
+#include "smartjs/src/sj_wifi.h"
 #include "v7/v7.h"
+
 #include "config.h"
 #include "cc3200_fs.h"
 #include "cc3200_sj_hal.h"
-#include "device_config.h"
 
 const char *build_id;
 
@@ -98,6 +99,7 @@ static void v7_task(void *arg) {
   MAP_UARTIntEnable(CONSOLE_UART, UART_INT_RX | UART_INT_RT);
   sl_Start(NULL, NULL, NULL);
 
+  mongoose_init();
   v7 = s_v7 = init_v7(&v7);
   sj_timers_api_setup(v7);
   sj_v7_ext_api_setup(v7);
@@ -107,8 +109,8 @@ static void v7_task(void *arg) {
   if (init_fs(v7) != 0) {
     fprintf(stderr, "FS initialization failed.\n");
   }
-  mongoose_init();
 
+  sj_gpio_init(v7);
   sj_gpio_api_setup(v7);
   sj_http_api_setup(v7);
   sj_i2c_api_setup(v7);
@@ -156,6 +158,10 @@ static void v7_task(void *arg) {
         if (s_gpio_js_handler != NULL) s_gpio_js_handler(pin, val);
         break;
       }
+      case MG_POLL_EVENT: {
+        /* Nothing to do, we poll on every iteration anyway. */
+        break;
+      }
     }
   }
 }
@@ -184,8 +190,9 @@ int main() {
   MAP_UARTFIFOLevelSet(CONSOLE_UART, UART_FIFO_TX1_8, UART_FIFO_RX4_8);
   MAP_UARTFIFOEnable(CONSOLE_UART);
 
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IOLBF, 0);
+  cs_log_set_level(LL_INFO);
 
   VStartSimpleLinkSpawnTask(8);
   osi_TaskCreate(v7_task, (const signed char *) "v7", V7_STACK_SIZE + 256, NULL,

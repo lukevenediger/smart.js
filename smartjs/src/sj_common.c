@@ -19,6 +19,7 @@
 #include "smartjs/src/sj_wifi_js.h"
 #include "smartjs/src/sj_wifi.h"
 #include "smartjs/src/sj_ultrasonic_distance_sensor_js.h"
+#include "smartjs/src/sj_udptcp.h"
 
 void sj_common_api_setup(struct v7 *v7) {
 /* Setup JS API */
@@ -39,6 +40,7 @@ void sj_common_api_setup(struct v7 *v7) {
 
   sj_pwm_api_setup(v7);
   sj_wifi_api_setup(v7);
+  sj_udp_tcp_api_setup(v7);
 
   // Peripherals
   sj_ultrasonic_distance_sensor_setup(v7);

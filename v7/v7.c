@@ -46,7 +46,9 @@
 /* If not specified explicitly, we guess platform by defines. */
 #ifndef CS_PLATFORM
 
-#if defined(__unix__) || defined(__APPLE__)
+#ifdef cc3200
+#define CS_PLATFORM CS_P_CC3200
+#elif defined(__unix__) || defined(__APPLE__)
 #define CS_PLATFORM CS_P_UNIX
 #elif defined(_WIN32)
 #define CS_PLATFORM CS_P_WINDOWS
@@ -310,7 +312,6 @@ typedef struct stat cs_stat_t;
 
 #include <assert.h>
 #include <ctype.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <string.h>
@@ -322,6 +323,10 @@ typedef struct stat cs_stat_t;
 #include <lwip/inet.h>
 #include <lwip/netdb.h>
 #include <lwip/dns.h>
+
+#ifndef LWIP_PROVIDE_ERRNO
+#include <errno.h>
+#endif
 
 #define LWIP_TIMEVAL_PRIVATE 0
 
@@ -346,6 +351,9 @@ typedef struct stat cs_stat_t;
 #define INT64_FMT PRId64
 #define INT64_X_FMT PRIx64
 #define __cdecl
+
+unsigned long os_random(void);
+#define random os_random
 
 #endif /* CS_PLATFORM == CS_P_ESP_LWIP */
 #endif /* CS_COMMON_PLATFORMS_PLATFORM_ESP_LWIP_H_ */
@@ -445,12 +453,22 @@ void mbuf_trim(struct mbuf *);
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <time.h>
 
-#include <simplelink.h>
+#ifndef __TI_COMPILER_VERSION__
+#include <fcntl.h>
+#include <sys/time.h>
+#endif
+
+#define MG_SOCKET_SIMPLELINK 1
+#define MG_DISABLE_SOCKETPAIR 1
+#define MG_DISABLE_SYNC_RESOLVER 1
+#define MG_DISABLE_POPEN 1
+#define MG_DISABLE_CGI 1
+
+#include <simplelink/include/simplelink.h>
 
 #define SOMAXCONN 8
 
@@ -547,7 +565,9 @@ void mbuf_trim(struct mbuf *);
 #define IP_DROP_MEMBERSHIP                  SL_IP_DROP_MEMBERSHIP
 
 #define socklen_t                           SlSocklen_t
+#ifdef __TI_COMPILER_VERSION__
 #define timeval                             SlTimeval_t
+#endif
 #define sockaddr                            SlSockAddr_t
 #define in6_addr                            SlIn6Addr_t
 #define sockaddr_in6                        SlSockAddrIn6_t
@@ -563,7 +583,6 @@ void mbuf_trim(struct mbuf *);
 #define fd_set                              SlFdSet_t
 
 #define socket                              sl_Socket
-#define close                               sl_Close
 #define accept                              sl_Accept
 #define bind                                sl_Bind
 #define listen                              sl_Listen
@@ -594,7 +613,9 @@ typedef struct stat cs_stat_t;
 #define INT64_X_FMT PRIx64
 #define __cdecl
 
-#define closesocket(x) close(x)
+#define closesocket(x) sl_Close(x)
+
+#define fileno(x) -1
 
 /* Some functions we implement for Mongoose. */
 
@@ -602,23 +623,56 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size);
 char *inet_ntoa(struct in_addr in);
 int inet_pton(int af, const char *src, void *dst);
 
-void cc3200_set_non_blocking_mode(int fd);
-
-struct hostent {
-  char *h_name;       /* official name of host */
-  char **h_aliases;   /* alias list */
-  int h_addrtype;     /* host address type */
-  int h_length;       /* length of address */
-  char **h_addr_list; /* list of addresses */
-};
-struct hostent *gethostbyname(const char *name);
-
 struct timeval;
 int gettimeofday(struct timeval *t, void *tz);
 
 long int random(void);
 
-#ifdef CC3200_ENABLE_SPIFFS
+#undef select
+#define select(nfds, rfds, wfds, efds, tout) \
+  sl_Select((nfds), (rfds), (wfds), (efds), (struct SlTimeval_t *) (tout))
+
+/* TI's libc does not have stat & friends, add them. */
+#ifdef __TI_COMPILER_VERSION__
+
+#include <file.h>
+
+typedef unsigned int mode_t;
+typedef size_t _off_t;
+typedef long ssize_t;
+
+struct stat {
+  int st_ino;
+  mode_t st_mode;
+  int st_nlink;
+  time_t st_mtime;
+  off_t st_size;
+};
+
+int _stat(const char *pathname, struct stat *st);
+#define stat(a, b) _stat(a, b)
+
+#define __S_IFMT 0170000
+
+#define __S_IFDIR 0040000
+#define __S_IFCHR 0020000
+#define __S_IFREG 0100000
+
+#define __S_ISTYPE(mode, mask) (((mode) & __S_IFMT) == (mask))
+
+#define S_IFDIR __S_IFDIR
+#define S_IFCHR __S_IFCHR
+#define S_IFREG __S_IFREG
+#define S_ISDIR(mode) __S_ISTYPE((mode), __S_IFDIR)
+#define S_ISREG(mode) __S_ISTYPE((mode), __S_IFREG)
+
+/* As of 5.2.7, TI compiler does not support va_copy() yet. */
+#define va_copy(apc, ap) ((apc) = (ap))
+
+#endif /* __TI_COMPILER_VERSION__ */
+
+
+#ifdef CC3200_FS_SPIFFS
 #include <common/spiffs/spiffs.h>
 
 typedef struct {
@@ -632,7 +686,7 @@ typedef struct {
 DIR *opendir(const char *dir_name);
 int closedir(DIR *dir);
 struct dirent *readdir(DIR *dir);
-#endif
+#endif /* CC3200_FS_SPIFFS */
 
 #endif /* CS_PLATFORM == CS_P_CC3200 */
 #endif /* CS_COMMON_PLATFORMS_PLATFORM_CC3200_H_ */
@@ -6457,18 +6511,17 @@ size_t mbuf_insert(struct mbuf *a, size_t off, const void *buf, size_t len) {
       memcpy(a->buf + off, buf, len);
     }
     a->len += len;
-  } else if ((p = (char *) MBUF_REALLOC(
-                  a->buf, (size_t)((a->len + len) * MBUF_SIZE_MULTIPLIER))) !=
-             NULL) {
-    a->buf = p;
-    memmove(a->buf + off + len, a->buf + off, a->len - off);
-    if (buf != NULL) {
-      memcpy(a->buf + off, buf, len);
-    }
-    a->len += len;
-    a->size = (size_t)(a->len * MBUF_SIZE_MULTIPLIER);
   } else {
-    len = 0;
+    size_t new_size = (a->len + len) * MBUF_SIZE_MULTIPLIER;
+    if ((p = (char *) MBUF_REALLOC(a->buf, new_size)) != NULL) {
+      a->buf = p;
+      memmove(a->buf + off + len, a->buf + off, a->len - off);
+      if (buf != NULL) memcpy(a->buf + off, buf, len);
+      a->len += len;
+      a->size = new_size;
+    } else {
+      len = 0;
+    }
   }
 
   return len;
@@ -15807,21 +15860,28 @@ V7_PRIVATE enum v7_type val_type(struct v7 *v7, val_t v) {
 /* clang-format off */
 static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC(" is not a function"),
+    V7_VEC("ANYEDGE"),  /* sjs */
     V7_VEC("Boolean"),
     V7_VEC("CLOSED"),  /* sjs */
     V7_VEC("Clubby"),  /* sjs */
     V7_VEC("Crypto"),
     V7_VEC("EvalError"),
     V7_VEC("Function"),
+    V7_VEC("HILEVEL"),  /* sjs */
     V7_VEC("Infinity"),
     V7_VEC("InternalError"),
     V7_VEC("LOG10E"),
+    V7_VEC("LOLEVEL"),  /* sjs */
     V7_VEC("MAX_VALUE"),
     V7_VEC("MIN_VALUE"),
     V7_VEC("NEGATIVE_INFINITY"),
+    V7_VEC("NEGEDGE"),  /* sjs */
     V7_VEC("Number"),
     V7_VEC("Object"),
+    V7_VEC("POSEDGE"),  /* sjs */
     V7_VEC("POSITIVE_INFINITY"),
+    V7_VEC("PULLDOWN"),  /* sjs */
+    V7_VEC("PULLUP"),  /* sjs */
     V7_VEC("RangeError"),
     V7_VEC("ReferenceError"),
     V7_VEC("RegExp"),
@@ -15834,6 +15894,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("WebSocket"),  /* sjs */
     V7_VEC("_modcache"),
     V7_VEC("accept"),
+    V7_VEC("address"), /* sjs */
     V7_VEC("arguments"),
     V7_VEC("base64_decode"),
     V7_VEC("base64_encode"),
@@ -15848,9 +15909,12 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("connect"),
     V7_VEC("constructor"),
     V7_VEC("create"),
+    V7_VEC("createConnection"),  /* sjs */
     V7_VEC("createServer"),  /* sjs */
+    V7_VEC("createSocket"),  /* sjs */
     V7_VEC("defineProperties"),
     V7_VEC("defineProperty"),
+    V7_VEC("destroy"), /* sjs */
     V7_VEC("disconnect"),  /* sjs */
     V7_VEC("every"),
     V7_VEC("exists"),
@@ -15859,6 +15923,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("forEach"),
     V7_VEC("fromCharCode"),
     V7_VEC("function"),
+    V7_VEC("getConnections"), /* sjs */
     V7_VEC("getDate"),
     V7_VEC("getDay"),
     V7_VEC("getFullYear"),
@@ -15898,6 +15963,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("module"),
     V7_VEC("multiline"),
     V7_VEC("number"),
+    V7_VEC("onclick"),  /* sjs */
     V7_VEC("onclose"),  /* sjs */
     V7_VEC("onopen"),  /* sjs */
     V7_VEC("parseFloat"),
@@ -15922,6 +15988,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("replace"),
     V7_VEC("request"),  /* sjs */
     V7_VEC("require"),
+    V7_VEC("resume"), /* sjs */
     V7_VEC("reverse"),
     V7_VEC("sayHello"),  /* sjs */
     V7_VEC("search"),
@@ -15975,7 +16042,7 @@ static const struct v7_vec_const v_dictionary_strings[] = {
     V7_VEC("valueOf"),
     V7_VEC("wdtFeed"),  /* sjs */
     V7_VEC("writable"),
-    V7_VEC("writeHead"),  /* sjs */
+    V7_VEC("writeHead")  /* sjs */
 };
 /* clang-format on */
 
@@ -17286,11 +17353,10 @@ V7_PRIVATE enum v7_err def_property(struct v7 *v7, val_t obj, const char *name,
                                     struct v7_property **res) {
   enum v7_err rcode = V7_OK;
   val_t name_val = v7_mk_undefined();
-  /* def_property_v can trigger GC */
-  struct gc_tmp_frame tf = new_tmp_frame(v7);
 
-  tmp_stack_push(&tf, &val);
-  tmp_stack_push(&tf, &name_val);
+  v7_own(v7, &obj);
+  v7_own(v7, &val);
+  v7_own(v7, &name_val);
 
   if (len == (size_t) ~0) {
     len = strlen(name);
@@ -17300,7 +17366,10 @@ V7_PRIVATE enum v7_err def_property(struct v7 *v7, val_t obj, const char *name,
   V7_TRY(def_property_v(v7, obj, name_val, attrs_desc, val, as_assign, res));
 
 clean:
-  tmp_frame_cleanup(&tf);
+  v7_disown(v7, &name_val);
+  v7_disown(v7, &val);
+  v7_disown(v7, &obj);
+
   return rcode;
 }
 

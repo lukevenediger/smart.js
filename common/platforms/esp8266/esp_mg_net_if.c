@@ -57,8 +57,9 @@ void IRAM mg_lwip_post_signal(enum mg_sig_type sig, struct mg_connection *nc) {
 
 void IRAM mg_lwip_mgr_schedule_poll(struct mg_mgr *mgr) {
   if (poll_scheduled) return;
-  system_os_post(MG_TASK_PRIORITY, MG_SIG_POLL, (uint32_t) mgr);
-  poll_scheduled = 1;
+  if (system_os_post(MG_TASK_PRIORITY, MG_SIG_POLL, (uint32_t) mgr)) {
+    poll_scheduled = 1;
+  }
 }
 
 static uint32_t time_left_micros(uint32_t now, uint32_t future) {
@@ -91,6 +92,7 @@ static err_t mg_lwip_tcp_conn_cb(void *arg, struct tcp_pcb *tpcb, err_t err) {
   }
   struct mg_lwip_conn_state *cs = (struct mg_lwip_conn_state *) nc->sock;
   cs->err = err;
+  if (err == 0) mg_lwip_set_keepalive_params(nc, 60, 10, 6);
 #ifdef SSL_KRYPTON
   if (err == 0 && nc->ssl != NULL) {
     SSL_set_fd(nc->ssl, (intptr_t) nc);
@@ -304,6 +306,7 @@ static err_t mg_lwip_accept_cb(void *arg, struct tcp_pcb *newtpcb, err_t err) {
   tcp_err(newtpcb, mg_lwip_tcp_error_cb);
   tcp_sent(newtpcb, mg_lwip_tcp_sent_cb);
   tcp_recv(newtpcb, mg_lwip_tcp_recv_cb);
+  mg_lwip_set_keepalive_params(nc, 60, 10, 6);
 #ifdef SSL_KRYPTON
   if (lc->ssl_ctx != NULL) {
     nc->ssl = SSL_new(lc->ssl_ctx);
@@ -342,12 +345,29 @@ int mg_if_listen_tcp(struct mg_connection *nc, union socket_address *sa) {
 }
 #endif
 
+#ifndef SJ_DISABLE_LISTENER
+int mg_if_listen_udp(struct mg_connection *nc, union socket_address *sa) {
+  struct mg_lwip_conn_state *cs = (struct mg_lwip_conn_state *) nc->sock;
+  struct udp_pcb *upcb = udp_new();
+  ip_addr_t *ip = (ip_addr_t *) &sa->sin.sin_addr.s_addr;
+  u16_t port = ntohs(sa->sin.sin_port);
+  cs->err = udp_bind(upcb, ip, port);
+  DBG(("%p udb_bind(%s:%u) = %d", nc, ipaddr_ntoa(ip), port, cs->err));
+  if (cs->err != ERR_OK) {
+    udp_remove(upcb);
+    return -1;
+  }
+  udp_recv(upcb, mg_lwip_udp_recv_cb, nc);
+  cs->pcb.udp = upcb;
+  return 0;
+}
+#else
 int mg_if_listen_udp(struct mg_connection *nc, union socket_address *sa) {
   (void) nc;
   (void) sa;
-  /* TODO(rojer) */
   return -1;
 }
+#endif
 
 int mg_lwip_tcp_write(struct mg_connection *nc, const void *data,
                       uint16_t len) {
@@ -591,12 +611,12 @@ static void mg_lwip_check_rexmit(void *arg) {
 
 void mg_poll_timer_cb(void *arg) {
   struct mg_mgr *mgr = (struct mg_mgr *) arg;
-  DBG(("poll tmr %p", s_mg_task_queue));
+  DBG(("poll tmr %p %p", s_mg_task_queue, mgr));
   mg_lwip_mgr_schedule_poll(mgr);
 }
 
 void mg_ev_mgr_init(struct mg_mgr *mgr) {
-  DBG(("%p Mongoose init, tq %p", mgr, s_mg_task_queue));
+  LOG(LL_INFO, ("%p Mongoose init, tq %p", mgr, s_mg_task_queue));
   system_os_task(mg_lwip_task, MG_TASK_PRIORITY, s_mg_task_queue,
                  MG_TASK_QUEUE_LEN);
   os_timer_setfn(&s_poll_tmr, mg_poll_timer_cb, mgr);

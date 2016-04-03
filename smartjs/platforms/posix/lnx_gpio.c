@@ -110,7 +110,8 @@ int gpio_get_value(int gpio_no) {
 
 int gpio_set_edge(int gpio_no, enum gpio_int_mode edge) {
   static const char *edge_names[] = {"none", "rising", "falling", "both"};
-  if (edge < 0 || edge >= (sizeof(edge_names) / sizeof(edge_names[0]))) {
+  /* signedness of enum is implementation defined */
+  if (((unsigned int) edge) >= (sizeof(edge_names) / sizeof(edge_names[0]))) {
     fprintf(stderr, "Invalid egde value\n");
     return -1;
   }
@@ -299,7 +300,7 @@ void sj_gpio_intr_init(f_gpio_intr_handler_t cb) {
 }
 
 int sj_gpio_intr_set(int pin, enum gpio_int_mode type) {
-  if (type == GPIO_INTR_DISABLE) {
+  if (type == GPIO_INTR_OFF) {
     gpio_remove_handler(pin);
     return 0;
   }

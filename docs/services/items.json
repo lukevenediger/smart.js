@@ -10,6 +10,10 @@
         },
         {
             "type": "markdown",
+            "name": "authtoken.service.yaml.md"
+        },
+        {
+            "type": "markdown",
             "name": "blobstore.service.yaml.md"
         },
         {
@@ -19,6 +23,10 @@
         {
             "type": "markdown",
             "name": "firmware.service.yaml.md"
+        },
+        {
+            "type": "markdown",
+            "name": "frontend.service.yaml.md"
         },
         {
             "type": "markdown",

@@ -24,6 +24,7 @@
 #include "smartjs/src/sj_mongoose.h"
 #include "smartjs/src/sj_prompt.h"
 #include "smartjs/src/sj_v7_ext.h"
+#include "smartjs/src/sj_gpio_js.h"
 
 #include "smartjs/platforms/esp8266/user/esp_fs.h"
 #include "smartjs/platforms/esp8266/user/esp_sj_uart.h"
@@ -58,6 +59,7 @@ void dbg_putc(char c) {
  * SmartJS initialization, called as an SDK timer callback (`os_timer_...()`).
  */
 void sjs_init(void *dummy) {
+  mongoose_init();
   /*
    * In order to see debug output (at least errors) during boot we have to
    * initialize debug in this point. But default we put debug to UART0 with
@@ -92,6 +94,7 @@ void sjs_init(void *dummy) {
   /* disable GC during further initialization */
   v7_set_gc_enabled(v7, 0);
 
+  sj_gpio_init(v7);
   esp_sj_uart_init(v7);
 
 #ifndef V7_NO_FS
@@ -107,8 +110,6 @@ void sjs_init(void *dummy) {
   sj_common_init(v7);
 
   sj_init_sys(v7);
-
-  mongoose_init();
 
   /* NOTE(lsm): must be done after mongoose_init(). */
   if (!init_device(v7)) {
