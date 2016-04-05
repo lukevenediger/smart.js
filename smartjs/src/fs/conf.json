@@ -1,13 +1,4 @@
 {
-  "wifi": {
-    "ap": {
-      "enable": true,
-      "keep_enabled": false,
-      "trigger_on_gpio": -1,
-      "ssid": "SMARTJS_??????",
-      "pass": "admin"
-    }
-  },
   "clubby": {
     "connect_on_boot": false,
     "device_auto_registration": false,
