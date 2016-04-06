@@ -55,7 +55,7 @@ typedef void (*clubby_proto_callback_t)(struct clubby_event *evt);
 ub_val_t clubby_proto_create_resp(struct ub_ctx *ctx, const char *device_id,
                                   const char *device_psk, const char *dst,
                                   int64_t id, int status,
-                                  const char *status_msg);
+                                  const char *status_msg, ub_val_t *resp_value);
 
 ub_val_t clubby_proto_create_frame_base(struct ub_ctx *ctx,
                                         const char *device_id,
@@ -71,9 +71,9 @@ void clubby_proto_send(struct mg_connection *nc, struct ub_ctx *ctx,
 
 void clubby_proto_init(clubby_proto_callback_t cb);
 
-struct mg_connection *clubby_proto_connect(struct mg_mgr *mgr,
-                                           const char *server_address,
-                                           void *context);
+struct mg_connection *clubby_proto_connect(
+    struct mg_mgr *mgr, const char *server_address, const char *ssl_server_name,
+    const char *ssl_ca_file, const char *ssl_client_cert_file, void *context);
 
 void clubby_proto_disconnect(struct mg_connection *nc);
 

@@ -114,6 +114,9 @@ static void free_clubby(struct clubby *clubby) {
    * TODO(alashkin): free queues, responses etc and find the way
    * to invoke free_clubby on Clubby object destruction
    */
+  free(clubby->cfg.ssl_server_name);
+  free(clubby->cfg.ssl_ca_file);
+  free(clubby->cfg.ssl_client_cert_file);
   free(clubby->cfg.device_psk);
   free(clubby->cfg.device_id);
   free(clubby->cfg.server_address);
@@ -467,17 +470,30 @@ static void clubby_send_cmds(struct clubby *clubby, struct ub_ctx *ctx,
   clubby_send_frame(clubby, ctx, id, frame);
 }
 
-static void clubby_send_resp(struct clubby *clubby, const char *dst, int64_t id,
-                             int status, const char *status_msg) {
+/*
+ * Sends resp for `evt.request`
+ * Trying to reproduce handleCmd from clubby.js
+ */
+
+static void clubby_send_response(struct clubby *clubby, const char *dst,
+                                 int64_t id, int status, const char *status_msg,
+                                 v7_val_t resp_v) {
   /*
    * Do not queueing responses. Work like clubby.js
    * TODO(alashkin): is it good?
    */
+  ub_val_t ubj;
+
   struct ub_ctx *ctx = ub_ctx_new();
-  clubby_proto_send(clubby->nc, ctx,
-                    clubby_proto_create_resp(ctx, clubby->cfg.device_id,
-                                             clubby->cfg.device_psk, dst, id,
-                                             status, status_msg));
+  if (!v7_is_undefined(resp_v)) {
+    ubj = obj_to_ubj(s_v7, ctx, resp_v);
+  }
+
+  clubby_proto_send(
+      clubby->nc, ctx,
+      clubby_proto_create_resp(
+          ctx, clubby->cfg.device_id, clubby->cfg.device_psk, dst, id, status,
+          status_msg, v7_is_undefined(resp_v) ? NULL : &ubj));
 }
 
 static void clubby_hello_req_callback(struct clubby_event *evt,
@@ -498,7 +514,8 @@ static void clubby_hello_req_callback(struct clubby_event *evt,
   snprintf(status_msg, sizeof(status_msg) - 1, "Hello, this is %s",
            clubby->cfg.device_id);
 
-  clubby_send_resp(clubby, src, evt->request.id, 0, status_msg);
+  clubby_send_response(clubby, src, evt->request.id, 0, status_msg,
+                       v7_mk_undefined());
 }
 
 static void clubby_send_hello(struct clubby *clubby) {
@@ -662,8 +679,9 @@ static void clubby_cb(struct clubby_event *evt) {
 
 static void clubby_connect(struct clubby *clubby) {
   clubby->session_flags &= ~SF_MANUAL_DISCONNECT;
-  struct mg_connection *nc =
-      clubby_proto_connect(&sj_mgr, clubby->cfg.server_address, clubby);
+  struct mg_connection *nc = clubby_proto_connect(
+      &sj_mgr, clubby->cfg.server_address, clubby->cfg.ssl_server_name,
+      clubby->cfg.ssl_ca_file, clubby->cfg.ssl_client_cert_file, clubby);
   if (nc == NULL) {
     schedule_reconnect(clubby);
   }
@@ -769,22 +787,6 @@ clean:
   free(cbp);
 }
 
-/*
- * Sends resp for `evt.request` with data from `val` and `st`
- * Trying to reproduce handleCmd from clubby.js
- * TODO(alashkin): handleCmd doesn't support `response` field
- */
-static void clubby_send_response(struct clubby *clubby, int64_t id,
-                                 const char *dst, v7_val_t val, v7_val_t st) {
-  struct ub_ctx *ctx = ub_ctx_new();
-  ub_val_t resp = clubby_proto_create_resp(
-      ctx, clubby->cfg.device_id, clubby->cfg.device_psk, dst, id,
-      v7_is_number(st) ? v7_to_number(st) : 0,
-      v7_is_string(val) ? v7_to_cstring(s_v7, &val) : NULL);
-
-  clubby_proto_send(clubby->nc, ctx, resp);
-}
-
 struct done_func_context {
   char *dst;
   int64_t id;
@@ -800,10 +802,15 @@ static enum v7_err done_func(struct v7 *v7, v7_val_t *res) {
   }
 
   struct done_func_context *ctx = v7_to_foreign(me);
-  v7_val_t valv = v7_arg(v7, 0);
-  v7_val_t stv = v7_arg(v7, 1);
+  v7_val_t cb_res = v7_arg(v7, 0);
+  v7_val_t cb_err = v7_arg(v7, 1);
 
-  clubby_send_response(ctx->clubby, ctx->id, ctx->dst, valv, stv);
+  if (!v7_is_undefined(cb_err)) {
+    clubby_send_response(ctx->clubby, ctx->dst, ctx->id, 1,
+                         v7_to_cstring(s_v7, &cb_err), v7_mk_undefined());
+  } else {
+    clubby_send_response(ctx->clubby, ctx->dst, ctx->id, 0, NULL, cb_res);
+  }
   *res = v7_mk_boolean(1);
 
   free(ctx->dst);
@@ -859,10 +866,10 @@ static void clubby_req_cb(struct clubby_event *evt, void *user_data) {
     v7_val_t res;
     cb_res = v7_apply(s_v7, *cbv, v7_get_global(s_v7), args, &res);
     if (cb_res == V7_OK) {
-      clubby_send_response(clubby, evt->request.id, dst, res,
-                           v7_mk_undefined());
+      clubby_send_response(clubby, dst, evt->request.id, 0, NULL, res);
     } else {
-      LOG(LL_ERROR, ("Callback invocation error"));
+      clubby_send_response(clubby, dst, evt->request.id, 1,
+                           v7_to_cstring(s_v7, &res), v7_mk_undefined());
     }
     free(dst);
     return;
@@ -1174,6 +1181,9 @@ SJ_PRIVATE enum v7_err Clubby_ctor(struct v7 *v7, v7_val_t *res) {
   GET_CB_PARAM(onopen, clubby_cmd_onopen);
   GET_CB_PARAM(onclose, clubby_cmd_onclose);
   GET_CB_PARAM(oncmd, s_oncmd_cmd);
+  GET_STR_PARAM(ssl_server_name, ssl_server_name);
+  GET_STR_PARAM(ssl_ca_file, ssl_ca_file);
+  GET_STR_PARAM(ssl_client_cert_file, ssl_client_cert_file);
 
   set_clubby(v7, this_obj, clubby);
   v7_val_t connect = v7_get(v7, arg, "connect", ~0);
@@ -1267,7 +1277,7 @@ struct clubby_event *sj_clubby_create_reply(struct clubby_event *evt) {
 }
 
 void sj_clubby_send_reply(struct clubby_event *evt, int status,
-                          const char *status_msg) {
+                          const char *status_msg, v7_val_t resp) {
   if (evt == NULL) {
     LOG(LL_WARN, ("Unable to send clubby reply"));
     return;
@@ -1278,7 +1288,7 @@ void sj_clubby_send_reply(struct clubby_event *evt, int status,
   char *dst = calloc(1, evt->request.src->len + 1);
   memcpy(dst, evt->request.src->ptr, evt->request.src->len);
 
-  clubby_send_resp(clubby, dst, evt->request.id, status, status_msg);
+  clubby_send_response(clubby, dst, evt->request.id, status, status_msg, resp);
   free(dst);
 }
 

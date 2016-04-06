@@ -972,7 +972,8 @@ static void fw_download_ev_handler(struct mg_connection *c, int ev, void *p) {
           if (!is_update_finished(ctx)) {
             /* Update terminated, but not because of error */
             notify_js(UJS_NOTHING_TODO, NULL);
-            sj_clubby_send_reply(s_clubby_reply, 0, ctx->status_msg);
+            sj_clubby_send_reply(s_clubby_reply, 0, ctx->status_msg,
+                                 v7_mk_undefined());
           } else {
             /* update ok */
             int len;
@@ -990,7 +991,8 @@ static void fw_download_ev_handler(struct mg_connection *c, int ev, void *p) {
         } else if (res < 0) {
           /* Error */
           notify_js(UJS_ERROR, NULL);
-          sj_clubby_send_reply(s_clubby_reply, 1, ctx->status_msg);
+          sj_clubby_send_reply(s_clubby_reply, 1, ctx->status_msg,
+                               v7_mk_undefined());
         }
 
         set_status(ctx, US_FINISHED);
@@ -1003,7 +1005,8 @@ static void fw_download_ev_handler(struct mg_connection *c, int ev, void *p) {
         if (!is_update_finished(ctx)) {
           /* Connection was terminated by server */
           notify_js(UJS_ERROR, NULL);
-          sj_clubby_send_reply(s_clubby_reply, 1, "Update failed");
+          sj_clubby_send_reply(s_clubby_reply, 1, "Update failed",
+                               v7_mk_undefined());
         } else if (is_reboot_requred(ctx) && !notify_js(UJS_COMPLETED, NULL)) {
           /*
            * Conection is closed by updater, rebooting if required
@@ -1032,8 +1035,23 @@ static void fw_download_ev_handler(struct mg_connection *c, int ev, void *p) {
 static int do_http_connect(const char *url) {
   LOG(LL_DEBUG, ("Connecting to: %s", url));
 
-  struct mg_connection *c =
-      mg_connect_http(&sj_mgr, fw_download_ev_handler, url, NULL, NULL);
+  struct mg_connect_opts opts;
+  memset(&opts, 0, sizeof(opts));
+
+#ifdef MG_ENABLE_SSL
+  if (strlen(url) > 8 && strncmp(url, "https://", 8) == 0) {
+    opts.ssl_server_name = get_cfg()->update.ssl_server_name;
+    opts.ssl_ca_cert = get_cfg()->update.ssl_ca_file;
+    if (opts.ssl_ca_cert == NULL) {
+      /* Use global CA file if updater specific one is not set */
+      opts.ssl_ca_cert = get_cfg()->tls.ca_file;
+    }
+    opts.ssl_cert = get_cfg()->update.ssl_client_cert_file;
+  }
+#endif
+
+  struct mg_connection *c = mg_connect_http_opt(&sj_mgr, fw_download_ev_handler,
+                                                opts, url, NULL, NULL);
 
   if (c == NULL) {
     LOG(LL_ERROR, ("Failed to connect to %s", url));
@@ -1041,17 +1059,6 @@ static int do_http_connect(const char *url) {
   }
 
   c->user_data = s_ctx;
-
-#ifdef SSL_KRYPTON
-  if (memcmp(url, "https", 5) == 0 && get_cfg()->tls.enable) {
-    char *ca_file = get_cfg()->tls.ca_file;
-    char *server_name = get_cfg()->tls.server_name;
-    mg_set_ssl(c, NULL, ca_file);
-    if (server_name != NULL) {
-      SSL_CTX_kr_set_verify_name(c->ssl_ctx, server_name);
-    }
-  }
-#endif
 
   return 1;
 }
@@ -1337,7 +1344,8 @@ static void handle_clubby_ready(struct clubby_event *evt, void *user_data) {
     s_clubby_reply->context = evt->context;
     sj_clubby_send_reply(
         s_clubby_reply, s_clubby_upd_status,
-        s_clubby_upd_status == 0 ? "Updated successfully" : "Update failed");
+        s_clubby_upd_status == 0 ? "Updated successfully" : "Update failed",
+        v7_mk_undefined());
     sj_clubby_free_reply(s_clubby_reply);
     s_clubby_reply = NULL;
   };
@@ -1404,7 +1412,7 @@ static void handle_update_req(struct clubby_event *evt, void *user_data) {
 
 bad_request:
   LOG(LL_ERROR, ("Failed to start update: %s", reply));
-  sj_clubby_send_reply(evt, 1, reply);
+  sj_clubby_send_reply(evt, 1, reply, v7_mk_undefined());
 }
 
 void init_updater(struct v7 *v7) {

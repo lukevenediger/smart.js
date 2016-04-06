@@ -31,15 +31,39 @@ int clubby_proto_is_connected(struct mg_connection *nc) {
   return nc != NULL && (nc->flags & MG_F_CLUBBY_CONNECTED);
 }
 
-struct mg_connection *clubby_proto_connect(struct mg_mgr *mgr,
-                                           const char *server_address,
-                                           void *context) {
+struct mg_connection *clubby_proto_connect(
+    struct mg_mgr *mgr, const char *server_address, const char *ssl_server_name,
+    const char *ssl_ca_file, const char *ssl_client_cert_file, void *context) {
   LOG(LL_DEBUG, ("Connecting to %s", server_address));
+  struct mg_connect_opts opts;
+  memset(&opts, 0, sizeof(opts));
+
+#ifdef MG_ENABLE_SSL
+  if (strlen(server_address) > 6 && strncmp(server_address, "wss://", 6) == 0) {
+    opts.ssl_server_name = (ssl_server_name && strlen(ssl_server_name) != 0)
+                               ? ssl_server_name
+                               : get_cfg()->clubby.ssl_server_name;
+    opts.ssl_ca_cert = (ssl_ca_file && strlen(ssl_ca_file) != 0)
+                           ? ssl_ca_file
+                           : get_cfg()->clubby.ssl_ca_file;
+    if (opts.ssl_ca_cert == NULL) {
+      /* Use global CA file if clubby specific one is not set */
+      opts.ssl_ca_cert = get_cfg()->tls.ca_file;
+    }
+    opts.ssl_cert = (ssl_client_cert_file && strlen(ssl_client_cert_file) != 0)
+                        ? ssl_client_cert_file
+                        : get_cfg()->clubby.ssl_client_cert_file;
+  }
+#else
+  (void) ssl_server_name;
+  (void) ssl_ca_file;
+  (void) ssl_client_cert_file;
+#endif
 
   struct mg_connection *nc =
-      mg_connect_ws(mgr, clubby_proto_handler, server_address, WS_PROTOCOL,
-                    "Sec-WebSocket-Extensions: " WS_PROTOCOL
-                    "-encoding; in=json; out=ubjson\r\n");
+      mg_connect_ws_opt(mgr, clubby_proto_handler, opts, server_address,
+                        WS_PROTOCOL, "Sec-WebSocket-Extensions: " WS_PROTOCOL
+                                     "-encoding; in=json; out=ubjson\r\n");
   if (nc == NULL) {
     LOG(LL_DEBUG, ("Cannot connect to %s", server_address));
     struct clubby_event evt;
@@ -49,21 +73,6 @@ struct mg_connection *clubby_proto_connect(struct mg_mgr *mgr,
     s_clubby_cb(&evt);
     return NULL;
   }
-
-#ifdef SSL_KRYPTON
-  /*
-   * TODO(alashkin): here we use TLS settings from configuration
-   * probably we have to move it to clubby local configuration
-   */
-  if (get_cfg()->tls.enable) {
-    char *ca_file = get_cfg()->tls.ca_file;
-    char *server_name = get_cfg()->tls.server_name;
-    mg_set_ssl(nc, NULL, ca_file);
-    if (server_name != NULL) {
-      SSL_CTX_kr_set_verify_name(nc->ssl_ctx, server_name);
-    }
-  }
-#endif
 
   nc->user_data = context;
 
@@ -123,7 +132,8 @@ ub_val_t clubby_proto_create_frame_base(struct ub_ctx *ctx,
 ub_val_t clubby_proto_create_resp(struct ub_ctx *ctx, const char *device_id,
                                   const char *device_psk, const char *dst,
                                   int64_t id, int status,
-                                  const char *status_msg) {
+                                  const char *status_msg,
+                                  ub_val_t *resp_value) {
   ub_val_t frame =
       clubby_proto_create_frame_base(ctx, device_id, device_psk, dst);
   ub_val_t resp = ub_create_array(ctx);
@@ -135,6 +145,10 @@ ub_val_t clubby_proto_create_resp(struct ub_ctx *ctx, const char *device_id,
 
   if (status_msg != 0) {
     ub_add_prop(ctx, respv, "status_msg", ub_create_string(ctx, status_msg));
+  }
+
+  if (resp_value != 0) {
+    ub_add_prop(ctx, respv, "resp", *resp_value);
   }
 
   return frame;
